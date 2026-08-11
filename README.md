@@ -39,11 +39,13 @@ npm run dev
 - `/examples/orillusion_3dtilesrender.html`：Orillusion WebGPU 3D Tiles 示例。
 - `/examples/threejs_3dtilesrender.html`：Three.js CDN 对照示例。
 
-构建生产产物：
+构建可发布的 `@orillusion-geo/core` 包：
 
 ```bash
 npm run build
 ```
+
+构建入口为 `src/index.ts`。产物输出到 `dist/`，仅包含库代码与类型声明；`@orillusion/core`、`3d-tiles-renderer` 会作为运行时依赖保留在包外，不会重复打入包体。
 
 ## 项目结构
 

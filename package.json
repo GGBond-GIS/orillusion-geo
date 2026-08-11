@@ -3,9 +3,21 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "vite --force",
-    "build": "tsc && vite build",
+    "build": "vite build && tsc --project tsconfig.build.json",
     "preview": "vite preview"
   },
   "dependencies": {
