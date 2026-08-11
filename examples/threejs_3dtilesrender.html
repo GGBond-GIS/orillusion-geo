@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Three.js 3D Tiles</title>
+    <style>
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #111; }
+      canvas { width: 100%; height: 100%; display: block; }
+      .tileset-selector {
+        position: fixed; z-index: 1; top: 16px; left: 16px; display: grid; gap: 6px;
+        padding: 10px 12px; border-radius: 6px; color: #fff; background: rgb(0 0 0 / 65%);
+        font: 14px/1.2 sans-serif;
+      }
+      .tileset-selector select { min-width: 280px; padding: 6px; }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.185.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.0/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <label class="tileset-selector" for="tileset-select">
+      3D Tiles 样例
+      <select id="tileset-select" aria-label="选择 3D Tiles 样例">
+        <option value="dayanpagoda-3dtiles-1_1/tileset.json">西安大雁塔（3D Tiles 1.1 / glb）</option>
+        <option value="dayanpagoda-3dtiles/tileset.json">西安大雁塔（3D Tiles 1.0 / b3dm）</option>
+      </select>
+      <span>LOD Error Target：<output id="error-target-value">6</output></span>
+      <input id="error-target" type="range" min="1" max="32" step="1" value="6" aria-label="调整 LOD Error Target" />
+    </label>
+    <script type="module" src="./threejs_3dtilesrender.js"></script>
+  </body>
+</html>

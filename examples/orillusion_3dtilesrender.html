@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Orillusion 3D Tiles</title>
+    <style>
+      html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #111; }
+      canvas { width: 100%; height: 100%; display: block; }
+      .tileset-selector {
+        position: fixed; z-index: 1; top: 16px; left: 16px; display: grid; gap: 6px;
+        padding: 10px 12px; border-radius: 6px; color: #fff; background: rgb(0 0 0 / 65%);
+        font: 14px/1.2 sans-serif;
+      }
+      .tileset-selector select { min-width: 280px; padding: 6px; }
+    </style>
+  </head>
+  <body>
+    <label class="tileset-selector" for="tileset-select">
+      3D Tiles 样例
+      <select id="tileset-select" aria-label="选择 3D Tiles 样例"></select>
+      <span>LOD Error Target：<output id="error-target-value">6</output></span>
+      <input id="error-target" type="range" min="1" max="32" step="1" value="6" aria-label="调整 LOD Error Target" />
+    </label>
+    <script type="module" src="./orillusion_3dtilesrender.ts"></script>
+  </body>
+</html>

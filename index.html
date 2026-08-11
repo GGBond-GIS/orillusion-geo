@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Orillusion Geo 示例</title>
+    <style>
+      :root { color: #eaf1f5; background: #18232c; font-family: Inter, "Microsoft YaHei", sans-serif; }
+      body { display: grid; min-height: 100vh; margin: 0; place-items: center; }
+      main { width: min(720px, calc(100% - 48px)); }
+      h1 { margin: 0; font-size: clamp(2rem, 6vw, 3.5rem); }
+      p { color: #b9c8d1; line-height: 1.7; }
+      nav { display: grid; gap: 12px; margin-top: 28px; }
+      a { padding: 18px 20px; border: 1px solid #405564; border-radius: 10px; color: inherit; background: #22313c; text-decoration: none; }
+      a:hover { border-color: #67b9e6; background: #2b3e4b; }
+      strong { display: block; margin-bottom: 6px; font-size: 1.1rem; }
+      small { color: #a5bac6; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Orillusion Geo</h1>
+      <p>基于 Orillusion 与 WebGPU 的三维 GIS 实验项目。当前提供大雁塔 3D Tiles 1.0 / 1.1 加载示例及 Three.js 对照示例。</p>
+      <nav>
+        <a href="./examples/orillusion_3dtilesrender.html">
+          <strong>Orillusion WebGPU 示例</strong>
+          <small>加载 3D Tiles，支持版本切换与 LOD Error Target 调整。</small>
+        </a>
+        <a href="./examples/threejs_3dtilesrender.html">
+          <strong>Three.js CDN 对照示例</strong>
+          <small>使用同一数据与 LOD 参数，便于进行行为和显示效果比较。</small>
+        </a>
+      </nav>
+    </main>
+  </body>
+</html>
