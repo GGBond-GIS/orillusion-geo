@@ -1,4 +1,25 @@
 import { defineConfig } from 'vite';
+import { writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+
+const packageManifest = {
+  name: '@orillusion-geo/core',
+  version: '0.0.0',
+  type: 'module',
+  main: './index.js',
+  module: './index.js',
+  types: './index.d.ts',
+  exports: {
+    '.': {
+      types: './index.d.ts',
+      import: './index.js',
+    },
+  },
+  dependencies: {
+    '@orillusion/core': '0.9.2',
+    '3d-tiles-renderer': '0.5.1',
+  },
+};
 
 /**
  * 生产构建配置。
@@ -27,6 +48,19 @@ export default defineConfig({
         /^@orillusion\/core\/.+/,
         '3d-tiles-renderer',
         /^3d-tiles-renderer\/.+/,
+      ],
+      plugins: [
+        {
+          name: 'write-package-manifest',
+          /** 写入可独立发布的 dist/package.json。 */
+          closeBundle() {
+            writeFileSync(
+              resolve('dist/package.json'),
+              `${JSON.stringify(packageManifest, null, 2)}\n`,
+              'utf8',
+            );
+          },
+        },
       ],
     },
   },
