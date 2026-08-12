@@ -2,7 +2,7 @@ import { Camera3D, ColliderComponent, Color, ComponentBase, Matrix4, MeshRendere
 import { PointerTracker } from './PointerTracker.js';
 import { Plane } from './Plane.js';
 import { Ray } from './Ray.js';
-import { adjustedPointerToCoords, clamp, decomposeMatrix4, makeRotateAroundPoint, mapLinear, setRayFromCamera } from './controlsUtils.js';
+import { adjustedPointerToCoords, clamp, decomposeMatrix4, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera } from './controlsUtils.js';
 
 export const NONE = 0;
 export const DRAG = 1;
@@ -104,7 +104,9 @@ export class EnvironmentControls extends ComponentBase {
   private _enabled = true;
   public rotationSpeed = 1;
   public minAltitude = 0;
-  public maxAltitude = 0.45 * Math.PI;
+  // 上拖最多与地面平行（π/2）。原版 3d-tiles 默认 0.45π（地平线下 9°），
+  // 会让贴地/地平线视角的拖拽与缩放被夹取弹回（用户要求放宽）。
+  public maxAltitude = 0.5 * Math.PI;
   public minDistance = 10;
   public maxDistance = Infinity;
   public minZoom = 0;
@@ -337,8 +339,16 @@ export class EnvironmentControls extends ComponentBase {
           pointerTracker.isRightClicked() ||
           (pointerTracker.isLeftClicked() && event.shiftKey)
         ) {
-          pivotPoint.copy(hit.point);
-          this.placePivotMesh(hit.point, pointerTracker.isPointerTouch() ? false : enabled);
+          // 绕点旋转的绕点 = 屏幕中心点（相机视线与椭球/场景的交点，即
+          // GlobeControls.getPivotPoint 的中心逻辑），而不是鼠标按下点——
+          // 否则在非屏幕中心处按下时，轨道绕屏幕边缘的点转，视角会闪动/漂移；
+          // 中心点配合 _alignCameraUp/_clampRotation 的固定点补偿，旋转全程
+          // 把屏幕中心锁死在视野中央（Cesium target 同款手感）。
+          setRayFromCamera(_ray, _screenCenter, camera);
+          const centerHit = this._raycast(_ray);
+          const rotatePoint = centerHit ? centerHit.point : hit.point;
+          pivotPoint.copy(rotatePoint);
+          this.placePivotMesh(rotatePoint, pointerTracker.isPointerTouch() ? false : enabled);
           this.setState(pointerTracker.isPointerTouch() ? WAITING : ROTATE);
         } else if (pointerTracker.isLeftClicked()) {
           pivotPoint.copy(hit.point);
@@ -942,7 +952,7 @@ export class EnvironmentControls extends ComponentBase {
       this.getCameraTransform().notifyLocalChange();
       this.getCameraTransform().updateWorldMatrix();
     } else {
-      // 没有命中任何东西时按缩放方向直接移动（原版的“按地面距离缩放”分支
+      // 没有命中任何东西时按缩放方向直接移动（原版的"按地面距离缩放"分支
       // 依赖 _getPointBelowCamera 相机碰撞逻辑，已随碰撞一并移除）。
       this.getCameraPosition().addScaledVector(finalZoomDirection, scale);
       this.getCameraTransform().notifyLocalChange();
@@ -1096,7 +1106,12 @@ export class EnvironmentControls extends ComponentBase {
 
     // 计算当前角度并夹取。
     _forward.set(0, 0, -1).transformDirection(this.getCameraWorldMatrix());
-    _right.set(1, 0, 0).transformDirection(this.getCameraWorldMatrix());
+    // fork 相机基向量（worldMatrix 列）：forward=+z、backward=-z、+x 列 =
+    // cross(up,forward)；three 的 +x 列 = fork 的 -x 列（同一物理相机、不同标签）。
+    // 角度符号与高度旋转轴必须用 fork 的 -x（= three 的 +x 物理方向），与原版
+    // three 的 set(1,0,0) 一一对应；用 fork +x 时地平线视角会算出负角度 → 误触发
+    // minAltitude 夹取，把相机直接拽回正俯视（实测：地平线视图首个滚轮事件即 90°→0°）。
+    _right.set(-1, 0, 0).transformDirection(this.getCameraWorldMatrix());
     this.getUpDirection(pivotPoint, _localUp);
 
     // 相对俯视视角的有符号角度。
@@ -1119,14 +1134,17 @@ export class EnvironmentControls extends ComponentBase {
     }
 
     // 绕 up 轴旋转。
-    _quaternion.setFromAxisAngle(_localUp, azimuth);
+    // ⚠️ fork 的 Quaternion.setFromAxisAngle(axis, angle) 是角度制（minified:
+    // `setFromAxisAngle(e,t){t*=Math.PI/180;...}`），而 applyAxisAngle 是弧度制；
+    // three.js 移植代码传弧度必须 ×RAD2DEG，否则旋转量被缩小 57 倍（右键旋转偏弱）。
+    _quaternion.setFromAxisAngle(_localUp, azimuth * RAD2DEG);
     makeRotateAroundPoint(pivotPoint, _quaternion, _rotMatrix);
     _cameraMatrix.copy(this.getCameraWorldMatrix()).premultiply(_rotMatrix);
     this.applyCameraMatrix(_cameraMatrix);
 
-    // 取高度旋转轴并旋转。
-    _right.set(1, 0, 0).transformDirection(this.getCameraWorldMatrix());
-    _quaternion.setFromAxisAngle(_right, -altitude);
+    // 取高度旋转轴并旋转（同为 fork -x，见上）。
+    _right.set(-1, 0, 0).transformDirection(this.getCameraWorldMatrix());
+    _quaternion.setFromAxisAngle(_right, -altitude * RAD2DEG);
     makeRotateAroundPoint(pivotPoint, _quaternion, _rotMatrix);
     _cameraMatrix.copy(this.getCameraWorldMatrix()).premultiply(_rotMatrix);
     this.applyCameraMatrix(_cameraMatrix);
@@ -1231,7 +1249,6 @@ export class EnvironmentControls extends ComponentBase {
 
     // 调整相机变换。
     _quaternion.setFromUnitVectors(_right, _targetRight);
-    this.getCameraTransform().localRotQuat.premultiply(_quaternion);
 
     // 计算活动点。
     let fixedPoint: Vector3 | null = null;
@@ -1241,11 +1258,23 @@ export class EnvironmentControls extends ComponentBase {
       fixedPoint = _pos.copy(zoomPoint);
     }
 
-    // 平移相机以保持固定点不动。
-    if (fixedPoint) {
-      this.getCameraTransform().updateWorldMatrix();
+    // 平移相机以保持固定点不动。仅在右键旋转（ROTATE/FREE_ROTATE）期间启用：
+    // 左键拖拽与滚轮缩放沿用基线行为（补偿不生效），避免改动拖拽/缩放手感。
+    // ⚠️ 生效时按原版 three 顺序：用**旧**世界矩阵求逆把固定点变换到相机局部，
+    // 再应用旋转并重算世界矩阵，最后用**新**世界矩阵正乘回世界求差值补位移。
+    // （in-place premultiply 不置脏、updateWorldMatrix 按脏标记跳过，须强制同步。）
+    const keepFixed = state === ROTATE || state === FREE_ROTATE;
+    if (fixedPoint && keepFixed) {
+      this.getCameraTransform().updateWorldMatrix(true);
       _invMatrix.copy(this.getCameraWorldMatrix()).invert();
       _vec.copy(fixedPoint).applyMatrix4(_invMatrix);
+    }
+
+    this.getCameraTransform().localRotQuat.premultiply(_quaternion);
+    this.getCameraTransform().notifyLocalChange();
+    this.getCameraTransform().updateWorldMatrix();
+
+    if (fixedPoint && keepFixed) {
       _vec.applyMatrix4(this.getCameraWorldMatrix());
       _center.subVectors(fixedPoint, _vec);
       this.getCameraPosition().add(_center);
@@ -1290,6 +1319,9 @@ export class EnvironmentControls extends ComponentBase {
     }
 
     // 构造旋转基。
+    // 注：本方法按用户要求还原为基线行为——setFromAxisAngle 不补 RAD2DEG，
+    // 夹取量被 fork 的角度制缩小 57 倍，实际几乎不生效（左键拖拽/滚轮缩放
+    // 沿用基线手感）。右键旋转的限位由 _applyRotation 的增量夹取承担。
     _forward.copy(up);
     _quaternion.setFromAxisAngle(_right, targetAngle);
     _forward.applyQuaternion(_quaternion).normalize();
@@ -1306,7 +1338,7 @@ export class EnvironmentControls extends ComponentBase {
       fixedPoint = _pos.copy(zoomPoint);
     }
 
-    // 平移相机以保持固定点不动。
+    // 平移相机以保持固定点不动（基线：补偿为弱夹取下的近似空操作，保留原样）。
     if (fixedPoint) {
       _invMatrix.copy(this.getCameraWorldMatrix()).invert();
       _vec.copy(fixedPoint).applyMatrix4(_invMatrix);

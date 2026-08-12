@@ -62,7 +62,16 @@ async function bootstrap(): Promise<void> {
   const mapToken = '39d358c825ec7e59142958656c0a6864';
   // 必须早于 Engine3D.init：避免 Orillusion 按默认五十万矩阵创建 48 MB 的全局矩阵缓冲。
   configureGlobeRendering({ matrixCapacity: 16_384 });
-  const engine = await Engine3D.init();
+  const engine = await Engine3D.init({
+    setting: {
+        useRTE: true,            // 开启相对相机渲染
+        RTEScale: 1.0,           // RTE 坐标缩放系数，一般保持默认
+        doublePrecision: true,   // 开启双精度矩阵
+        render: {
+            useLogDepth: true,   // 开启对数深度缓冲
+        },
+    },
+});
   const scene = new Scene3D();
   const cameraObject = new Object3D();
   // three.js 约定相机：GlobeControls 按 three 数学操作 transform，viewMatrix 层还原 fork 的 +z 前向。
