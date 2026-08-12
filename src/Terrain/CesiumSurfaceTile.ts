@@ -1,4 +1,4 @@
-import { Cartesian2, Cartesian3, type TerrainData, type TerrainProvider } from '@cesium/engine';
+import { BoundingSphere, Cartesian2, Cartesian3, type TerrainData, type TerrainProvider } from '@cesium/engine';
 import { TerrainTileState, type TerrainTileKey } from './TerrainTileState.js';
 
 /** Cesium TerrainMesh 的运行时结构；该类型并未由 @cesium/engine 公开导出。 */
@@ -30,6 +30,8 @@ export interface TerrainMeshReadyEvent {
 /**
  * 从 Cesium GlobeSurfaceTile 抽出的、与渲染器无关的地形状态机。
  * 它只使用 TerrainProvider/TerrainData 的公开 API；资源创建由调用方完成。
+ * 对齐 Cesium TerrainState：UNLOADED → RECEIVING → RECEIVED → TRANSFORMING → TRANSFORMED → READY，
+ * FAILED 时从父瓦片 upsampling（并先推动父级状态机，与 Cesium processTerrainStateMachine 一致）。
  */
 export class CesiumSurfaceTile {
   /** 当前瓦片坐标。 */
@@ -42,6 +44,21 @@ export class CesiumSurfaceTile {
   public terrainData: TerrainData | null = null;
   /** Cesium Worker 输出网格。 */
   public mesh: CesiumTerrainMesh | null = null;
+  /**
+   * 对齐 Cesium QuadtreeTile.upsampledFromParent：
+   * 地形数据由父级上采样产生（terrainData.wasCreatedByUpsampling），
+   * 且该瓦片所有影像都失败/无效时，四个子瓦片全部 upsampled 则不再细化父瓦片。
+   */
+  public upsampledFromParent = false;
+  /**
+   * 由真实地形网格顶点计算出的 ECEF 包围球（对齐 Cesium TileBoundingRegion 语义），
+   * 地形未就绪时为 null，选择器回退到父级或矩形包围球。
+   */
+  public boundingVolume: BoundingSphere | null = null;
+  /** 瓦片对象创建时间，用于 LOD 阶段耗时统计。 */
+  public readonly createdAt = performance.now();
+  /** 地形状态机进入 Ready 的时间，用于 LOD 阶段耗时统计。 */
+  public readyAt = 0;
   private pending: Promise<void> | null = null;
 
   /**
@@ -75,6 +92,12 @@ export class CesiumSurfaceTile {
       return false;
     }
     if (this.state === TerrainTileState.Failed) {
+      // 对齐 Cesium processTerrainStateMachine：父级地形未就绪时先推动父级状态机，
+      // 再尝试从父级 TerrainData 上采样。
+      const parent = this.parent;
+      if (parent && (!parent.terrainData || (parent.terrainData as { canUpsample?: boolean }).canUpsample === false)) {
+        parent.update(provider, exaggeration, exaggerationRelativeHeight);
+      }
       this.upsample(provider);
       return false;
     }
@@ -84,6 +107,7 @@ export class CesiumSurfaceTile {
     }
     if (this.state === TerrainTileState.Transformed) {
       this.state = TerrainTileState.Ready;
+      this.readyAt = performance.now();
       return true;
     }
     return false;
@@ -97,6 +121,8 @@ export class CesiumSurfaceTile {
     if (this.pending) return;
     this.terrainData = null;
     this.mesh = null;
+    this.boundingVolume = null;
+    this.upsampledFromParent = false;
     this.state = TerrainTileState.Unloaded;
   }
 
@@ -124,6 +150,7 @@ export class CesiumSurfaceTile {
   private upsample(provider: TerrainProvider): void {
     const parent = this.parent;
     if (!parent?.terrainData) return;
+    if ((parent.terrainData as { canUpsample?: boolean }).canUpsample === false) return;
     const { x, y, level } = this.key;
     const source = parent.key;
     const request = parent.terrainData.upsample(provider.tilingScheme, source.x, source.y, source.level, x, y, level);
@@ -131,6 +158,8 @@ export class CesiumSurfaceTile {
     this.state = TerrainTileState.Receiving;
     this.pending = request.then(data => {
       this.terrainData = data;
+      // 对齐 Cesium：terrainData.wasCreatedByUpsampling() 时标记 upsampledFromParent。
+      this.upsampledFromParent = (data as { wasCreatedByUpsampling?: () => boolean }).wasCreatedByUpsampling?.() ?? true;
       this.state = TerrainTileState.Received;
     }).catch(() => {
       this.state = TerrainTileState.Failed;
@@ -150,9 +179,47 @@ export class CesiumSurfaceTile {
     this.state = TerrainTileState.Transforming;
     this.pending = request.then(mesh => {
       this.mesh = mesh;
+      // 对齐 Cesium TileBoundingRegion：地形就绪后按真实顶点计算包围球，
+      // 供选择器做 SSE 距离、视锥剔除与加载优先级，未就绪时由调用方回退父级。
+      this.boundingVolume = this.computeBoundingSphere(mesh);
       this.state = TerrainTileState.Transformed;
     }).catch(() => {
       this.state = TerrainTileState.Failed;
     }).finally(() => { this.pending = null; });
+  }
+
+  /**
+   * 用 Cesium TerrainEncoding 解码全部顶点并计算 ECEF 包围球。
+   * 与 Cesium BoundingSphere.fromVertices 相同：中心取顶点均值，半径为最大距离。
+   * @param mesh Cesium Worker 输出的网格。
+   * @returns 覆盖真实地形的包围球。
+   */
+  private computeBoundingSphere(mesh: CesiumTerrainMesh): BoundingSphere {
+    const vertexCount = mesh.vertices.length / mesh.stride;
+    const position = new Cartesian3();
+    let center = Cartesian3.ZERO.clone();
+    if (vertexCount > 0) {
+      let sx = 0;
+      let sy = 0;
+      let sz = 0;
+      for (let index = 0; index < vertexCount; index += 1) {
+        mesh.encoding.decodePosition(mesh.vertices, index, position);
+        sx += position.x;
+        sy += position.y;
+        sz += position.z;
+      }
+      const inverse = 1 / vertexCount;
+      center = new Cartesian3(sx * inverse, sy * inverse, sz * inverse);
+    }
+    let radius = 0;
+    for (let index = 0; index < vertexCount; index += 1) {
+      mesh.encoding.decodePosition(mesh.vertices, index, position);
+      const dx = position.x - center.x;
+      const dy = position.y - center.y;
+      const dz = position.z - center.z;
+      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (distance > radius) radius = distance;
+    }
+    return new BoundingSphere(center, radius);
   }
 }

@@ -1,6 +1,6 @@
 import { BitmapTexture2D, Reference, Texture } from '@orillusion/core';
-import { Cartesian4, ImageryLayer, WebMercatorProjection, type Rectangle, type TerrainProvider } from '@cesium/engine';
-import { GlobeReprojectionCompute } from '../Renderer/GlobeReprojectionCompute.js';
+import { Cartesian4, WebMercatorProjection, type ImageryLayer, type Rectangle, type TerrainProvider } from '@cesium/engine';
+import { GlobeReprojectionCompute, type GlobeReprojectionOptions, type GlobeReprojectionTask } from '../Renderer/GlobeReprojectionCompute.js';
 import type { CesiumGlobeTileTexture } from '../Renderer/CesiumGlobeTileMaterial.js';
 import { CesiumFrameTaskQueue } from '../Scheduler/CesiumFrameTaskQueue.js';
 import type { TerrainTileKey } from './TerrainTileState.js';
@@ -30,7 +30,7 @@ interface CesiumTileImageryLike {
   textureTranslationAndScale?: Cartesian4;
   useWebMercatorT?: boolean;
   freeResources?(): void;
-  /** 当前 TileImagery 已得到最终影像或最终祖先回退。 */
+  /** 当前 TileImagery 已得到最终影像或最终祖先回退（对齐 Cesium processStateMachine 返回 true）。 */
   done?: boolean;
 }
 
@@ -62,6 +62,13 @@ interface ManagedImagery {
   disposed: boolean;
 }
 
+/** 待批处理的重投影任务。 */
+interface PendingReprojection {
+  managed: ManagedImagery;
+  source: Texture;
+  options: GlobeReprojectionOptions;
+}
+
 /** 影像运行时统计，用于验证静止场景不再增长。 */
 export interface CesiumImageryRuntimeStatistics {
   managedImageryCount: number;
@@ -86,10 +93,15 @@ export class CesiumImageryRuntime {
   public readonly reprojector: GlobeReprojectionCompute;
   /** 当前在途影像请求数。 */
   public activeRequests = 0;
-  /** 对齐 Cesium RequestScheduler 的并发保护上限。 */
-  public maximumConcurrentRequests = 8;
+  /**
+   * 对齐 Cesium RequestScheduler.maximumRequestsPerServer（18）的影像请求并发上限；
+   * 超过时保持 Unloaded，下一帧重试（对齐 Cesium 被节流时返回 undefined 的语义）。
+   */
+  public maximumConcurrentRequests = 18;
+  /** 单帧最多排入一次 GPU 批次的重投影数量，对齐 Cesium 帧内 ComputeCommand 批量语义。 */
+  public maximumReprojectionsPerFrame = 32;
   private readonly textureUploadQueue = new CesiumFrameTaskQueue(2.0);
-  private readonly reprojectionQueue = new CesiumFrameTaskQueue(2.0);
+  private readonly pendingReprojections: PendingReprojection[] = [];
 
   /**
    * 创建全局影像运行时。
@@ -112,27 +124,55 @@ export class CesiumImageryRuntime {
   }
 
   /**
-   * 延迟到后续帧执行计算重投影，保证它不与同一影像的上传处于同一帧。
+   * 把重投影任务加入本帧批处理队列。与 Cesium 一致：多个重投影在同一个
+   * compute pass 内按序执行（frameState.commandList 语义），不再逐帧逐张。
    * @param managed 已创建源纹理的状态对象。
-   * @param execute 实际 ComputeShader 提交步骤。
+   * @param source 源 WebMercator 纹理。
+   * @param options 重投影参数。
    */
-  public enqueueReprojection(managed: ManagedImagery, execute: () => void): void {
+  public enqueueReprojection(managed: ManagedImagery, source: Texture, options: GlobeReprojectionOptions): void {
     if (managed.reprojectionQueued || managed.disposed) return;
     managed.reprojectionQueued = true;
-    void this.reprojectionQueue.enqueue(() => {
-      managed.reprojectionQueued = false;
-      if (!managed.disposed) execute();
-    }).catch(() => { if (!managed.disposed) managed.state = ImageryState.Failed; });
+    this.pendingReprojections.push({ managed, source, options });
   }
 
   /**
-   * 对齐 Cesium endFrame：网络状态机结束后才消费 GPU 资源准备队列。
-   * 分别限额消费上传与重投影；网络状态机与 GPU 提交仍分帧，但不会把精细层固定拖慢到每帧一张。
+   * 帧末消费 GPU 准备队列：
+   *  - 纹理上传是同步 copyExternalImageToTexture，按数量限额消费，无背压；
+   *  - 重投影整批提交一个 CommandEncoder，仅在上一批 GPU 工作完成前跳过（对齐 Cesium 帧内计算队列）。
    */
   public processGpuQueues(): number {
-    const uploaded = this.textureUploadQueue.process(4);
-    const reprojected = this.reprojectionQueue.process(1);
+    const uploaded = this.textureUploadQueue.process(16);
+    const reprojected = this.processReprojections();
     return uploaded + reprojected;
+  }
+
+  /** 把当前积压的重投影任务作为一批提交。 */
+  private processReprojections(): number {
+    if (this.reprojector.isBusy || this.pendingReprojections.length === 0) {
+      return 0;
+    }
+    const batch = this.pendingReprojections.splice(0, this.maximumReprojectionsPerFrame);
+    for (const entry of batch) {
+      entry.managed.reprojectionQueued = false;
+    }
+    const tasks: GlobeReprojectionTask[] = batch.map(entry => ({
+      source: entry.source,
+      options: entry.options,
+      resolve: texture => {
+        const managed = entry.managed;
+        if (managed.disposed) { texture.destroy(true); return; }
+        managed.texture = texture;
+        managed.state = ImageryState.Ready;
+      },
+      reject: () => {
+        const managed = entry.managed;
+        // 对齐 Cesium：重投影失败回退到 TEXTURE_LOADED，需要地理投影时下一帧重新入队。
+        if (!managed.disposed) managed.state = ImageryState.TextureLoaded;
+      },
+    }));
+    void this.reprojector.reprojectBatch(tasks);
+    return tasks.length;
   }
 
   /** 清理 Cesium 已无引用的影像及对应 Orillusion GPU 纹理。 */
@@ -161,7 +201,7 @@ export class CesiumImageryRuntime {
   /** 释放所有队列和纹理资源。 */
   public dispose(): void {
     this.textureUploadQueue.clear();
-    this.reprojectionQueue.clear();
+    this.pendingReprojections.length = 0;
     for (const managed of this.managed.values()) this.destroyManaged(managed);
     this.managed.clear();
   }
@@ -172,7 +212,7 @@ export class CesiumImageryRuntime {
       managedImageryCount: this.managed.size,
       activeRequests: this.activeRequests,
       pendingTextureUploads: this.textureUploadQueue.statistics.pending,
-      pendingReprojections: this.reprojectionQueue.statistics.pending,
+      pendingReprojections: this.pendingReprojections.length,
     };
   }
 
@@ -201,7 +241,7 @@ export class CesiumImageryRuntime {
 export class CesiumSurfaceImagery {
   private readonly tile: CesiumTerrainTileLike;
   private readonly options: CesiumSurfaceImageryOptions;
-  private initializedLayerCount = 0;
+  private readonly initializedLayers = new Set<ImageryLayer>();
   private revisionValue = 0;
   private disposed = false;
 
@@ -220,13 +260,39 @@ export class CesiumSurfaceImagery {
   public get revision(): number { return this.revisionValue; }
 
   /**
-   * 对齐 Cesium GlobeSurfaceTile.renderable：每个 TileImagery 只要已有可用 readyImagery 即可渲染。
-   * readyImagery 可以是祖先回退；最终 loadingImagery 完成后会继续更新同一个材质。
+   * 对齐 Cesium GlobeSurfaceTile.processImagery 的 renderable 判定：
+   * 只要有任一 TileImagery 完成或存在可用 readyImagery，该瓦片影像即可渲染；
+   * 全部失败/完成的 TileImagery 不再阻塞渲染（对齐 Cesium：FAILED/INVALID 且无加载中祖先 → done）。
    */
   public get isReadyForCommit(): boolean {
-    return this.tile.data.imagery.length > 0 && this.tile.data.imagery.every(tileImagery => {
-      if (!tileImagery.readyImagery) return false;
-      return Boolean(this.getTexture(tileImagery.readyImagery, tileImagery.useWebMercatorT ?? false));
+    const tileImageryCollection = this.tile.data.imagery;
+    if (tileImageryCollection.length === 0) return false;
+    let isAnyTileLoaded = false;
+    let isDoneLoading = true;
+    for (const tileImagery of tileImageryCollection) {
+      const done = !tileImagery.loadingImagery || tileImagery.done === true;
+      const hasTexture = Boolean(tileImagery.readyImagery && this.getTexture(tileImagery.readyImagery, tileImagery.useWebMercatorT ?? false));
+      isAnyTileLoaded = isAnyTileLoaded || done || hasTexture;
+      isDoneLoading = isDoneLoading && done;
+    }
+    return isAnyTileLoaded || isDoneLoading;
+  }
+
+  /** 对齐 Cesium processImagery 返回的 isDoneLoading：所有 TileImagery 都已完成加载。 */
+  public get isDoneLoading(): boolean {
+    return this.tile.data.imagery.every(tileImagery => !tileImagery.loadingImagery || tileImagery.done === true);
+  }
+
+  /**
+   * 对齐 Cesium processImagery 的 isUpsampledOnly 影像部分：
+   * 所有 TileImagery 的 loadingImagery 都处于 FAILED/INVALID（无 TileImagery 时视为真）。
+   */
+  public get allTileImageryFailedOrInvalid(): boolean {
+    return this.tile.data.imagery.every(tileImagery => {
+      const loading = tileImagery.loadingImagery;
+      if (!loading) return false;
+      const managed = this.options.runtime.managed.get(loading);
+      return managed !== undefined && (managed.state === ImageryState.Failed || managed.state === ImageryState.Invalid);
     });
   }
 
@@ -261,6 +327,7 @@ export class CesiumSurfaceImagery {
         textureCoordinateRectangle: tileImagery.textureCoordinateRectangle,
         textureTranslationAndScale: tileImagery.textureTranslationAndScale,
         useWebMercatorT: tileImagery.useWebMercatorT ?? false,
+        imageryLayer: ready.imageryLayer,
       });
     }
     return output;
@@ -274,14 +341,35 @@ export class CesiumSurfaceImagery {
     this.tile.data.imagery.length = 0;
   }
 
-  /** 调用 Cesium ImageryLayer._createTileImagerySkeletons，并且只对新图层执行一次。 */
+  /**
+   * 移除指定图层在本瓦片的 TileImagery 骨架。
+   * 对齐 Cesium GlobeSurfaceTileProvider._onLayerRemoved 的 removeTileImagery。
+   */
+  public removeLayer(layer: ImageryLayer): void {
+    const tileImageryCollection = this.tile.data.imagery;
+    for (let index = 0; index < tileImageryCollection.length; index += 1) {
+      const tileImagery = tileImageryCollection[index];
+      const imagery = tileImagery.loadingImagery ?? tileImagery.readyImagery;
+      if (imagery && imagery.imageryLayer === layer) {
+        tileImagery.freeResources?.();
+        tileImageryCollection.splice(index, 1);
+        this.revisionValue += 1;
+        return;
+      }
+    }
+  }
+
+  /** 调用 Cesium ImageryLayer._createTileImagerySkeletons，并且每个图层只执行一次。
+   *  图层未就绪（对齐 Cesium PLACEHOLDER 语义）时保持未初始化，就绪后再创建骨架。 */
   private createMissingSkeletons(): void {
-    for (let index = this.initializedLayerCount; index < this.options.imageryLayers.length; index += 1) {
-      const layer = this.options.imageryLayers.get(index);
-      if (!layer?.show || !layer.ready) continue;
+    const layers = this.options.imageryLayers;
+    for (let index = 0; index < layers.length; index += 1) {
+      const layer = layers.get(index);
+      if (!layer || this.initializedLayers.has(layer)) continue;
+      if (!layer.show || !layer.ready) continue;
+      this.initializedLayers.add(layer);
       (layer as unknown as CesiumImageryLayerInternals)._createTileImagerySkeletons(this.tile, this.options.terrainProvider);
     }
-    this.initializedLayerCount = this.options.imageryLayers.length;
   }
 
   /**
@@ -324,8 +412,13 @@ export class CesiumSurfaceImagery {
       break;
     }
     if (managed.state === ImageryState.Failed || managed.state === ImageryState.Invalid) {
-      if (closestLoadingAncestor) this.processImagery(closestLoadingAncestor, !useWebMercatorT, false);
-      else tileImagery.done = Boolean(tileImagery.readyImagery);
+      if (closestLoadingAncestor) {
+        this.processImagery(closestLoadingAncestor, !useWebMercatorT, false);
+      } else {
+        // 对齐 Cesium：影像失败/无效且没有加载中的祖先 → 该 TileImagery 完成，
+        // 即使没有 readyImagery 也不再阻塞瓦片渲染。
+        tileImagery.done = true;
+      }
     }
   }
 
@@ -347,7 +440,7 @@ export class CesiumSurfaceImagery {
     }
     const needsReprojection = managed.state === ImageryState.Ready && needGeographicProjection && !managed.texture;
     if (managed.state === ImageryState.TextureLoaded || needsReprojection) {
-      this.options.runtime.enqueueReprojection(managed, () => this.reprojectTexture(managed, needGeographicProjection));
+      this.enqueueReprojection(managed, needGeographicProjection);
     }
   }
 
@@ -389,33 +482,28 @@ export class CesiumSurfaceImagery {
 
   /**
    * 对应 ImageryLayer._reprojectTexture，WebMercator 到 Geographic 由 Orillusion ComputeShader 完成。
+   * 与 Cesium 的 ComputeCommand 一致：提交后保持 TRANSITIONING，GPU 完成后才进入 READY；
+   * 期间 eligibleForUnloading=false，源纹理和目标纹理都不会被缓存淘汰。
    * @param managed 已有源纹理的影像。
    * @param needGeographicProjection 是否需要地理投影结果。
    */
-  private reprojectTexture(managed: ManagedImagery, needGeographicProjection: boolean): void {
+  private enqueueReprojection(managed: ManagedImagery, needGeographicProjection: boolean): void {
     const source = managed.textureWebMercator ?? managed.texture;
     if (!source) { managed.state = ImageryState.Invalid; return; }
     const provider = managed.source.imageryLayer.imageryProvider;
     const isWebMercator = provider.tilingScheme.projection instanceof WebMercatorProjection;
     const nativeRectangle = provider.tilingScheme.tileXYToNativeRectangle(managed.source.x, managed.source.y, managed.source.level);
     if (needGeographicProjection && isWebMercator && managed.source.rectangle.width / Math.max(1, (source as any).width ?? 256) > 1e-5) {
-      // 对齐 Cesium ComputeCommand：提交后保持 TRANSITIONING，只有 GPU postExecute 完成才进入 READY。
-      // 这段时间 eligibleForUnloading=false，源纹理和目标纹理都不会被缓存淘汰。
       managed.state = ImageryState.Transitioning;
-      void this.options.runtime.reprojector.reproject(source, {
+      this.options.runtime.enqueueReprojection(managed, source, {
         width: Math.max(1, (source as any).width ?? 256),
         height: Math.max(1, (source as any).height ?? 256),
         geographicRectangle: managed.source.rectangle,
         webMercatorRectangle: nativeRectangle,
-      }).then(texture => {
-        if (managed.disposed) { texture.destroy(true); return; }
-        managed.texture = texture;
-        managed.state = ImageryState.Ready;
-      }).catch(() => {
-        if (!managed.disposed) managed.state = ImageryState.TextureLoaded;
       });
       return;
-    } else if (needGeographicProjection) {
+    }
+    if (needGeographicProjection) {
       managed.texture = source;
     }
     managed.state = ImageryState.Ready;

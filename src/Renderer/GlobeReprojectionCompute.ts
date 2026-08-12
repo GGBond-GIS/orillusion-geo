@@ -1,4 +1,4 @@
-import { CResizeEvent, ComputeShader, Context3D, Reference, RenderTexture, Texture } from '@orillusion/core';
+import { Context3D, RenderTexture, Texture } from '@orillusion/core';
 import type { Rectangle } from '@cesium/engine';
 
 /** Cesium WebMercator 影像重投影参数。 */
@@ -13,12 +13,43 @@ export interface GlobeReprojectionOptions {
   webMercatorRectangle: Rectangle;
 }
 
+/** 单次重投影任务。 */
+export interface GlobeReprojectionTask {
+  /** 源 WebMercator 影像纹理。 */
+  source: Texture;
+  /** 重投影参数。 */
+  options: GlobeReprojectionOptions;
+  /** 成功后返回目标地理纹理。 */
+  resolve(texture: RenderTexture): void;
+  /** 失败时回调。 */
+  reject(error: unknown): void;
+}
+
+/** 每任务 uniform 大小（8 个 f32 = 32 字节，对齐 uniform 缓冲 16 字节约束）。 */
+const taskUniformBytes = 32;
+/** WebGPU 要求 uniform 绑定的 buffer 偏移按 256 字节对齐，故每任务步长取 256。 */
+const taskUniformStride = 256;
+
+// 项目 tsconfig 未引入 @webgpu/types，此处仅声明用到的 WebGPU 全局（运行时不产生任何代码）。
+declare const GPUBufferUsage: { UNIFORM: number; COPY_DST: number };
+
 /**
- * 以 Orillusion ComputeShader 执行 Cesium ImageryLayer 的 WebMercator 到 Geographic 重投影。
- * 每个任务把 Cesium 计算出的瓦片范围固化为 shader 常量，避免绕过 Orillusion 的官方计算着色器提交链路。
+ * 以 Orillusion 设备执行 Cesium ImageryLayer 的 WebMercator 到 Geographic 重投影。
+ * 对齐 Cesium 的实现方式：ReprojectWebMercator 是**一个**共享 shader 程序，
+ * 每个影像通过 uniform 提供矩形参数；全部重投影作为 ComputeCommand 追加到
+ * 帧的 compute pass 内按序执行。
+ *
+ * 这里 reprojectBatch 把本帧全部任务录制成一个 CommandEncoder / 一个 compute pass，
+ * 只提交一次并等待一次 onSubmittedWorkDone；shader module 与 pipeline 只编译一次
+ * （首次批处理时惰性创建），之后每帧只有 N 个轻量 bind group 与 N 次 dispatch，
+ * 避免“每任务一个 WGSL 常量 shader → 每帧几十次 shader 编译”导致的主线程卡顿。
  */
 export class GlobeReprojectionCompute {
   private readonly context: Context3D;
+  /** 上一次批处理是否仍在等待 GPU 完成；忙碌时跳过本帧新批次（对齐 Cesium 帧内命令队列）。 */
+  public isBusy = false;
+  /** 共享 compute pipeline（GPUComputePipeline，@webgpu/types 未安装故用 any）。 */
+  private pipeline: any = null;
 
   /**
    * 创建重投影计算器。
@@ -27,97 +58,125 @@ export class GlobeReprojectionCompute {
   public constructor(context: Context3D) { this.context = context; }
 
   /**
-   * 将 WebMercator 源影像写入可按地理纬度采样的新纹理。
-   * @param source Cesium 影像上传后的 Orillusion 纹理。
-   * @param options 源、目标范围及输出尺寸。
-   * @returns GPU 队列确认计算完成后返回的目标纹理。
+   * 批量执行重投影：一个 CommandEncoder 内录制全部任务后统一提交。
+   * @param tasks 本帧待执行的重投影任务。
+   * @returns 全部任务已提交并等待 GPU 完成。
    */
-  public reproject(source: Texture, options: GlobeReprojectionOptions): Promise<RenderTexture> {
-    // Compute storage、后续材质采样和 Orillusion 渲染图管理都需要对应 usage；
-    // 缺少 RENDER_ATTACHMENT 会让引擎为纹理生成的 BindGroup 失效。
-    const target = new RenderTexture(options.width, options.height, 'rgba8unorm', false, 0x01 | 0x02 | 0x04 | 0x08 | 0x10, 1, 0, false, false, this.context);
-    const compute = new ComputeShader(createReprojectionShader(options));
-    compute.setSamplerTexture('sourceTexture', source);
-    compute.setStorageTexture('targetTexture', target);
-    compute.workerSizeX = Math.ceil(options.width / 8);
-    compute.workerSizeY = Math.ceil(options.height / 8);
-    compute.workerSizeZ = 1;
+  public reprojectBatch(tasks: GlobeReprojectionTask[]): Promise<void> {
+    if (tasks.length === 0) {
+      return Promise.resolve();
+    }
+    this.isBusy = true;
+    const device = this.context.device;
     const command = this.context.gpuContext.beginCommandEncoder();
     let computePass: ReturnType<typeof command.beginComputePass> | undefined;
+    const targets: RenderTexture[] = [];
+    let paramsBuffer: any = null;
+
     try {
+      const pipeline = this.ensurePipeline();
+      const layout = pipeline.getBindGroupLayout(0);
       computePass = command.beginComputePass();
-      compute.compute(computePass);
-      // Cesium ComputeCommand 只属于当前帧。Orillusion ComputeShader 会在首次 compute 时永久监听 resize，
-      // 但其 destroy() 不会移除监听；瓦片纹理释放后 resize 会再次用失效纹理创建 BindGroup。
-      this.detachResizeListener(compute);
+      computePass.setPipeline(pipeline);
+
+      // 每任务 8 个 f32：west、south、east、north、nativeSouth、nativeNorth、pad、pad。
+      // 缓冲按 256 字节/任务步长分配，数据写入各自槽位（bind group 偏移按 256 对齐）。
+      const count = tasks.length;
+      const params = new Float32Array(count * (taskUniformStride / 4));
+      for (let index = 0; index < count; index += 1) {
+        const options = tasks[index].options;
+        const base = index * (taskUniformStride / 4);
+        params[base] = options.geographicRectangle.west;
+        params[base + 1] = options.geographicRectangle.south;
+        params[base + 2] = options.geographicRectangle.east;
+        params[base + 3] = options.geographicRectangle.north;
+        params[base + 4] = options.webMercatorRectangle.south;
+        params[base + 5] = options.webMercatorRectangle.north;
+      }
+      paramsBuffer = device.createBuffer({ size: count * taskUniformStride, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(paramsBuffer, 0, params);
+
+      for (let index = 0; index < count; index += 1) {
+        const task = tasks[index];
+        const target = new RenderTexture(task.options.width, task.options.height, 'rgba8unorm', false, 0x01 | 0x02 | 0x04 | 0x08 | 0x10, 1, 0, false, false, this.context);
+        targets.push(target);
+        // 使用源纹理自带的 sampler（filtering，与源纹理的 mipmap 配置一致），
+        // 避免自建 sampler 与纹理视图的 maxLod 校验不匹配。
+        const group = device.createBindGroup({
+          layout,
+          entries: [
+            { binding: 0, resource: task.source.gpuSampler },
+            { binding: 1, resource: task.source.getGPUView() },
+            { binding: 2, resource: target.getGPUView() },
+            { binding: 3, resource: { buffer: paramsBuffer, offset: index * taskUniformStride, size: taskUniformBytes } },
+          ],
+        });
+        computePass.setBindGroup(0, group);
+        computePass.dispatchWorkgroups(
+          Math.ceil(task.options.width / 8),
+          Math.ceil(task.options.height / 8),
+          1,
+        );
+      }
       computePass.end();
       computePass = undefined;
       this.context.gpuContext.endCommandEncoder(command);
     } catch (error) {
-      // Orillusion 的 computeCommand 在 compute() 抛错时不会结束 pass，会污染整个 CommandEncoder。
-      // 此处保证 pass 成对结束，并丢弃未提交的 encoder，让真正的首个资源错误可以被单独处理。
       try { computePass?.end(); } catch { /* pass 已失效时无需再次处理 */ }
-      this.detachResizeListener(compute);
-      this.detachTextureReferences(compute, source, target);
-      target.destroy(true);
+      paramsBuffer?.destroy();
+      for (const target of targets) target.destroy(true);
+      for (const task of tasks) task.reject(error);
+      this.isBusy = false;
       return Promise.reject(error);
     }
-    return this.context.device.queue.onSubmittedWorkDone().then(() => {
-      this.detachTextureReferences(compute, source, target);
-      compute.destroy(true);
-      return target;
+
+    return device.queue.onSubmittedWorkDone().then(() => {
+      this.isBusy = false;
+      paramsBuffer?.destroy();
+      for (let index = 0; index < tasks.length; index += 1) {
+        tasks[index].resolve(targets[index]);
+      }
+    }).catch((error: unknown) => {
+      this.isBusy = false;
+      paramsBuffer?.destroy();
+      for (const target of targets) target.destroy(true);
+      for (const task of tasks) task.reject(error);
     });
   }
 
-  /**
-   * 撤销 Orillusion ComputeShader 自动注册、但不会在 destroy 中清理的窗口尺寸监听。
-   * @param compute 已完成当前 Cesium 重投影命令录制的计算着色器。
-   */
-  private detachResizeListener(compute: ComputeShader): void {
-    type ResizeListener = { id: number; thisObject?: unknown };
-    type ResizeDispatcher = Context3D & {
-      listeners?: Record<string, ResizeListener[]>;
-      removeEventListenerAt(id: number): boolean;
-    };
-    const dispatcher = this.context as ResizeDispatcher;
-    const listeners = dispatcher.listeners?.[CResizeEvent.RESIZE];
-    if (!listeners) return;
-    for (const listener of [...listeners]) {
-      if (listener.thisObject === compute) dispatcher.removeEventListenerAt(listener.id);
+  /** 惰性创建共享 compute pipeline（只编译一次）。 */
+  private ensurePipeline(): any {
+    if (this.pipeline) {
+      return this.pipeline;
     }
-  }
-
-  /**
-   * 清除 ComputeShader.genGroups 为源纹理和目标纹理增加的 Orillusion 引用。
-   * @param compute 已完成提交的单帧计算命令。
-   * @param source 当前重投影源纹理。
-   * @param target 当前重投影目标纹理。
-   */
-  private detachTextureReferences(compute: ComputeShader, source: Texture, target: RenderTexture): void {
-    const references = Reference.getInstance();
-    references.detached(source, compute);
-    references.detached(target, compute);
+    const device = this.context.device;
+    const module = device.createShaderModule({ code: createReprojectionShader() });
+    this.pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'CsMain' } });
+    return this.pipeline;
   }
 }
 
 /**
- * 生成单瓦片重投影 WGSL。Cesium 的 Rectangle 是 west、south、east、north 顺序。
- * @param options Cesium 骨架计算出的源和目标范围。
- * @returns 可直接交给 Orillusion ComputeShader 的 WGSL。
+ * 生成共享重投影 WGSL：矩形参数来自 group(0) binding(3) 的 uniform 结构，
+ * 全部任务复用同一个 shader module 与 pipeline（对齐 Cesium ReprojectWebMercatorVS/FS）。
  */
-function createReprojectionShader(options: GlobeReprojectionOptions): string {
-  const geographic = options.geographicRectangle;
-  const native = options.webMercatorRectangle;
+function createReprojectionShader(): string {
   return /* wgsl */ `
-@group(0) @binding(0) var sourceTexture: texture_2d<f32>;
-@group(0) @binding(1) var sourceTextureSampler: sampler;
+struct ReprojectParams {
+  west: f32,
+  south: f32,
+  east: f32,
+  north: f32,
+  nativeSouth: f32,
+  nativeNorth: f32,
+  _pad0: f32,
+  _pad1: f32,
+}
+
+@group(0) @binding(0) var sourceTextureSampler: sampler;
+@group(0) @binding(1) var sourceTexture: texture_2d<f32>;
 @group(0) @binding(2) var targetTexture: texture_storage_2d<rgba8unorm, write>;
-const west = ${geographic.west};
-const south = ${geographic.south};
-const east = ${geographic.east};
-const north = ${geographic.north};
-const nativeSouth = ${native.south};
-const nativeNorth = ${native.north};
+@group(0) @binding(3) var<uniform> params: ReprojectParams;
 const maximumRadius = 6378137.0;
 
 @compute @workgroup_size(8, 8, 1)
@@ -125,13 +184,13 @@ fn CsMain(@builtin(global_invocation_id) id: vec3<u32>) {
   let size = textureDimensions(targetTexture);
   if (id.x >= size.x || id.y >= size.y) { return; }
   let uv = (vec2<f32>(id.xy) + vec2<f32>(0.5)) / vec2<f32>(size);
-  let longitude = mix(west, east, uv.x);
+  let longitude = mix(params.west, params.east, uv.x);
   // WebGPU 外部图像 y=0 位于北侧；Orillusion 的纹理采样也保持该方向。
-  let latitude = mix(south, north, uv.y);
+  let latitude = mix(params.south, params.north, uv.y);
   let nativeX = maximumRadius * longitude;
   let nativeY = maximumRadius * log(tan(0.7853981633974483 + latitude * 0.5));
-  let sourceU = (nativeX - maximumRadius * west) / (maximumRadius * (east - west));
-  let sourceV = (nativeY - nativeSouth) / (nativeNorth - nativeSouth);
+  let sourceU = (nativeX - maximumRadius * params.west) / (maximumRadius * (params.east - params.west));
+  let sourceV = (nativeY - params.nativeSouth) / (params.nativeNorth - params.nativeSouth);
   let color = textureSampleLevel(sourceTexture, sourceTextureSampler, vec2<f32>(sourceU, sourceV), 0.0);
   textureStore(targetTexture, vec2<i32>(id.xy), color);
 }`;

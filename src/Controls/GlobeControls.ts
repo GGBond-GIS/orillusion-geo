@@ -150,7 +150,10 @@ export class GlobeControls extends ComponentBase {
     const height = Math.max(0, distance - this.ellipsoid.maximumRadius);
     const horizon = Math.sqrt(height * (height + 2 * this.ellipsoid.maximumRadius));
     this.camera.near = Math.max(1, Math.min(1000, Math.max(1, height) * this.nearMargin));
-    this.camera.far = Math.max(this.camera.near + 1, horizon + 0.1 + this.ellipsoid.maximumRadius * this.farMargin);
+    // 注意：只取地平线会把地球最远端（distance + radius）切掉，导致整个球体被视锥远平面剔除。
+    // 与 Cesium Camera 一致，far 必须覆盖到地球远端：max(地平线, 相机到地球最远端)。
+    const globeFarSide = distance + this.ellipsoid.maximumRadius;
+    this.camera.far = Math.max(this.camera.near + 1, horizon + 0.1 + this.ellipsoid.maximumRadius * this.farMargin, globeFarSide);
   }
 
   /** 取得相机世界坐标。 */
