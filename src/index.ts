@@ -1,3 +1,14 @@
 export { TileBoundingVolume, type TileBoundingVolumeDefinition } from './Math/TileBoundingVolume.js';
 export { OrillusionTilesRenderer } from './Renderer/OrillusionTilesRenderer.js';
 export { TilesRendererComponent, type TilesRendererComponentOptions } from './Renderer/TilesRendererComponent.js';
+export { Globe, type GlobeOptions, type GlobeStatistics, type GlobeTileCoordinate } from './Globe/Globe.js';
+export { GlobeComponent, type GlobeComponentOptions } from './Globe/GlobeComponent.js';
+export { GlobeControls, type GlobeControlsOptions } from './Controls/GlobeControls.js';
+export { GlobeReprojectionCompute, type GlobeReprojectionOptions } from './Renderer/GlobeReprojectionCompute.js';
+export { CesiumGlobeTileMaterial, type CesiumGlobeTileTexture } from './Renderer/CesiumGlobeTileMaterial.js';
+export { configureGlobeRendering, type GlobeRenderingConfiguration } from './Renderer/configureGlobeRendering.js';
+export { CesiumSurfaceTile, type CesiumTerrainMesh, type TerrainMeshReadyEvent } from './Terrain/CesiumSurfaceTile.js';
+export { TerrainTileState, type TerrainTileKey } from './Terrain/TerrainTileState.js';
+export { configureCesiumWorkerRuntime } from './Terrain/CesiumWorkerRuntime.js';
+export { CesiumImageryRuntime, CesiumSurfaceImagery, type CesiumSurfaceImageryOptions } from './Terrain/CesiumImagerySkeleton.js';
+export { GlobeQuadtree, type GlobeQuadtreeOptions } from './Terrain/GlobeQuadtree.js';
