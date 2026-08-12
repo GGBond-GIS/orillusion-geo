@@ -17,6 +17,13 @@ export interface CesiumTerrainMesh {
     decodeTextureCoordinates(vertices: Float32Array, index: number, result: Cartesian2): Cartesian2;
     decodeWebMercatorT(vertices: Float32Array, index: number): number;
   };
+  /** 非裙边（地表）三角形的索引数量；其后全部是裙边墙三角形。 */
+  indexCountWithoutSkirts: number;
+  /** 四条边的边缘顶点索引；裙边顶点数 = 四者长度之和（Cesium worker 输出）。 */
+  westIndicesSouthToNorth: ArrayLike<number>;
+  southIndicesEastToWest: ArrayLike<number>;
+  eastIndicesNorthToSouth: ArrayLike<number>;
+  northIndicesWestToEast: ArrayLike<number>;
 }
 
 /** 供 Orillusion 渲染层消费的已完成地形数据。 */

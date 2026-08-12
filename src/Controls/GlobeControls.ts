@@ -2,7 +2,7 @@ import { Camera3D, Matrix4, Object3D, Quaternion, Vector2, Vector3 } from '@oril
 import { Ellipsoid, WGS84_ELLIPSOID } from '../Math/Ellipsoid.js';
 import { DRAG, EnvironmentControls, FREE_ROTATE, NONE, ZOOM, type EnvironmentControlsOptions } from './EnvironmentControls.js';
 import { Ray } from './Ray.js';
-import { adjustedPointerToCoords, clamp, lerp, makeRotateAroundPoint, mapLinear, setRayFromCamera } from './controlsUtils.js';
+import { adjustedPointerToCoords, clamp, lerp, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera } from './controlsUtils.js';
 
 let _invMatrix!: Matrix4;
 // Matrix4 依赖 Engine3D.init 之后的全局矩阵池，模块级创建会在 init 前崩溃；
@@ -27,6 +27,10 @@ const _toCenter = new Vector3();
 const _ray = new Ray();
 const _ellipsoid = new Ellipsoid();
 const _pointer = new Vector2();
+/** adjustCamera 用的经纬度暂存（getPositionToCartographic 返回弧度）。 */
+const _latLon: { lon: number; lat: number; height: number } = { lon: 0, lat: 0, height: 0 };
+/** adjustCamera 计算地平线距离时的最低海拔（与原版一致，避免贴地时 far 过近）。 */
+const MIN_ELEVATION = 2550;
 let _cameraMatrixLocal!: Matrix4;
 /** GlobeControls 初始化参数（EnvironmentControls 参数 + Globe 专有参数）。 */
 export interface GlobeControlsOptions extends EnvironmentControlsOptions {
@@ -185,20 +189,33 @@ export class GlobeControls extends EnvironmentControls {
   }
 
   /**
-   * 更新相机 near/far 裁剪面以包含当前视角下的椭球，
-   * 并按高度插值 near 以避免高空时近平面过远导致的 z-fighting。
+   * 更新相机 near/far 裁剪面（3d-tiles 原版自适应逻辑，透视分支）：
+   *  - near：距地表 25% 半径余量内从 1 插值到 1000——高空避免近平面过近造成
+   *    瓦片间 z-fight，贴地时贴近地表；
+   *  - far：取地平线距离——近距时 far≈500km，比固定 1e8 的 log 深度精度好约
+   *    200 倍（log 编码只依赖 far），裙边/缝隙 z-fight 大幅减少。
+   * 曾因 fork 的 zPrePass 线性深度 vs 颜色通道 log frag_depth 编码不匹配导致
+   * 近距片段被全拒（黑屏）而改用固定裁剪面；示例现以 zPrePass=false 运行
+   * （颜色通道自写自比 log 深度），动态 near/far 恢复生效。
    */
   public override adjustCamera(camera: Camera3D): void {
     ensureScratchMatrices();
     super.adjustCamera(camera);
 
-    // fork 渲染管线（zPrePass 线性深度 vs 颜色通道 log 深度、以及 log2Depth 的
-    // 假设）与 3d-tiles 原版的自适应 near/far 不兼容：实测高空推远近平面或
-    // 地平线 far 在部分高度会让深度测试拒绝全部片段 → 黑屏。沿用本仓库旧示例
-    // 验证过的固定裁剪面（near=1, far=1e8）：log 深度编码下各高度渲染均正常，
-    // near 不需要外推、far 覆盖整颗地球。
-    camera.near = 1;
-    camera.far = 100_000_000;
+    const { ellipsoidFrame, ellipsoidFrameInverse, ellipsoid, nearMargin, farMargin } = this;
+    const maxRadius = this._getMaxWorldRadius();
+    const distanceToCenter = _vec.setFromMatrixPosition(ellipsoidFrame).sub(this.getCameraPosition()).length;
+    const margin = nearMargin * maxRadius;
+    const alpha = clamp((distanceToCenter - maxRadius) / margin, 0, 1);
+    const minNear = lerp(1, 1000, alpha);
+    camera.near = Math.max(minNear, distanceToCenter - maxRadius - margin);
+
+    _pos.copy(this.getCameraPosition()).applyMatrix4(ellipsoidFrameInverse);
+    ellipsoid.getPositionToCartographic(_pos, _latLon);
+    const elevation = Math.max(ellipsoid.getPositionElevation(_pos), MIN_ELEVATION);
+    // getPositionToCartographic 返回弧度，calculateHorizonDistance 要求度。
+    const horizonDistance = ellipsoid.calculateHorizonDistance(_latLon.lat * RAD2DEG, elevation);
+    camera.far = horizonDistance + 0.1 + maxRadius * farMargin;
     camera.updateProjection();
   }
 

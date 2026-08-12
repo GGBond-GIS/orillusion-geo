@@ -98,8 +98,14 @@ export class CesiumImageryRuntime {
    * 超过时保持 Unloaded，下一帧重试（对齐 Cesium 被节流时返回 undefined 的语义）。
    */
   public maximumConcurrentRequests = 18;
-  /** 单帧最多排入一次 GPU 批次的重投影数量，对齐 Cesium 帧内 ComputeCommand 批量语义。 */
-  public maximumReprojectionsPerFrame = 32;
+  /**
+   * 每帧最多重投影的影像数量。地理投影影像（非 WebMercator）时每个任务都是一次
+   * 全屏 compute dispatch（源纹理采样 + 目标写入，显存带宽密集）；默认 32 会让
+   * 单帧 GPU 出现带宽峰值（"GPU 占用高但硬件没跑满"的典型来源之一），降到 8
+   * 把负载分摊到多帧，影像就绪略慢但帧率稳定。WebMercator 影像（tianditu 等）
+   * 走 webMercatorUv 路径，不经过这里。
+   */
+  public maximumReprojectionsPerFrame = 8;
   private readonly textureUploadQueue = new CesiumFrameTaskQueue(2.0);
   private readonly pendingReprojections: PendingReprojection[] = [];
 

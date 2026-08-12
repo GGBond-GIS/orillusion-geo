@@ -1,4 +1,4 @@
-import { Camera3D, ColliderComponent, Engine3D, GeometryBase, MeshColliderShape, MeshRenderer, Object3D, UnLitMaterial, setFrameDelay } from '@orillusion/core';
+import { Camera3D, ColliderComponent, Engine3D, GeometryBase, MeshColliderShape, MeshRenderer, Object3D, UnLitMaterial, Vector3, setFrameDelay } from '@orillusion/core';
 import { Cartesian2, Cartesian3, Cartesian4, EllipsoidTerrainProvider, ImageryLayerCollection, type ImageryLayer, type ImageryProvider, type TerrainProvider } from '@cesium/engine';
 import { CesiumGlobeTileMaterial, type CesiumGlobeTileTexture } from '../Renderer/CesiumGlobeTileMaterial.js';
 import { CesiumFrameTaskQueue } from '../Scheduler/CesiumFrameTaskQueue.js';
@@ -416,15 +416,37 @@ export class Globe {
    */
   private createTerrainObject(terrainMesh: CesiumTerrainMesh, coordinate: GlobeTileCoordinate): Object3D {
     const vertexCount = terrainMesh.vertices.length / terrainMesh.stride;
-    const positions = new Float32Array(vertexCount * 3);
-    const uvs = new Float32Array(vertexCount * 2);
-    const webMercatorUvs = new Float32Array(vertexCount * 2);
+    // 平坦椭球地形（EllipsoidTerrainProvider，高度恒为 0）下相邻瓦片边缘高度完全
+    // 一致，不存在 LOD 高度差裂缝——Cesium 的裙边（默认 = 几何误差 × 5，
+    // level 12 ≈ 24km、level 2 ≈ 2.5 万 km）纯属冗余几何：浪费显存/带宽，贴地与
+    // 地平线视角还会露出竖墙（用户反馈的"裙边"）。平坦地形直接剔除：只保留
+    // indexCountWithoutSkirts 个地表三角形、只解码非裙边顶点。真实地形 provider
+    // （有高度起伏）时裙边保留（补缝必需）。
+    const isFlatTerrain = this.terrainProvider instanceof EllipsoidTerrainProvider;
+    const skirtVertexCount = isFlatTerrain
+      ? terrainMesh.westIndicesSouthToNorth.length +
+        terrainMesh.southIndicesEastToWest.length +
+        terrainMesh.eastIndicesNorthToSouth.length +
+        terrainMesh.northIndicesWestToEast.length
+      : 0;
+    const surfaceVertexCount = vertexCount - skirtVertexCount;
+    const indexCount = isFlatTerrain ? terrainMesh.indexCountWithoutSkirts : terrainMesh.indices.length;
+    const positions = new Float32Array(surfaceVertexCount * 3);
+    const uvs = new Float32Array(surfaceVertexCount * 2);
+    const webMercatorUvs = new Float32Array(surfaceVertexCount * 2);
     const position = new Cartesian3();
     const uv = new Cartesian2();
-    for (let index = 0; index < vertexCount; index += 1) {
+    // RTC（Relative To Center）：顶点存相对瓦片中心的偏移（小数值，f32 精度高），
+    // 绝对 ECEF 中心放进瓦片实体 transform。引擎 RTE 模式按模型世界位置的高/低
+    // 分裂表做分裂双精度减法（modelPos - cameraPos），配合 doublePrecision(f64
+    // 矩阵) 让贴地视角的顶点精度达到毫米级；若直接存绝对 ECEF f32（~6.4e6，
+    // ulp≈0.5m），近距渲染会抖动。Cesium 的 TerrainEncoding.decodePosition 返回
+    // 绝对坐标（已加回 relativeToCenter），这里减回 mesh.center 得到相对坐标。
+    const center = terrainMesh.center;
+    for (let index = 0; index < surfaceVertexCount; index += 1) {
       terrainMesh.encoding.decodePosition(terrainMesh.vertices, index, position);
       terrainMesh.encoding.decodeTextureCoordinates(terrainMesh.vertices, index, uv);
-      positions.set([position.x, position.y, position.z], index * 3);
+      positions.set([position.x - center.x, position.y - center.y, position.z - center.z], index * 3);
       uvs.set([uv.x, uv.y], index * 2);
       webMercatorUvs.set([uv.x, terrainMesh.encoding.decodeWebMercatorT(terrainMesh.vertices, index)], index * 2);
     }
@@ -432,10 +454,12 @@ export class Globe {
     geometry.setAttribute('position', positions);
     geometry.setAttribute('uv', uvs);
     geometry.setAttribute('TEXCOORD_1', webMercatorUvs);
-    geometry.setIndices(terrainMesh.indices);
-    geometry.addSubGeometry({ indexStart: 0, indexCount: terrainMesh.indices.length, vertexStart: 0, vertexCount, firstStart: 0, index: 0, topology: 0 });
+    geometry.setIndices(isFlatTerrain ? terrainMesh.indices.subarray(0, indexCount) : terrainMesh.indices);
+    geometry.addSubGeometry({ indexStart: 0, indexCount, vertexStart: 0, vertexCount: surfaceVertexCount, firstStart: 0, index: 0, topology: 0 });
     const object = new Object3D();
     object.name = `Terrain ${coordinate.level}/${coordinate.x}/${coordinate.y}`;
+    // 瓦片实体位移 = 绝对 ECEF 瓦片中心；顶点缓冲是相对偏移（RTC）。
+    object.transform.localPosition = new Vector3(center.x, center.y, center.z);
     const renderer = object.addComponent(MeshRenderer);
     renderer.geometry = geometry;
     renderer.material = this.placeholderMaterial;

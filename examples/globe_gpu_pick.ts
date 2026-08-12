@@ -69,6 +69,7 @@ async function bootstrap(): Promise<void> {
         doublePrecision: true,   // 开启双精度矩阵
         render: {
             useLogDepth: true,   // 开启对数深度缓冲
+            zPrePass: false,     // 关闭线性深度预通道：与 log 颜色深度编码不匹配会使遮挡失效 → 裙边可见
         },
     },
 });
@@ -133,6 +134,24 @@ async function bootstrap(): Promise<void> {
   // mode==='pixel' 时渲染任务已自动开启拾取（并挂 FXAA）；显式再开一次是幂等的，
   // 与官方 gpupick 示例的写法保持一致。
   view.enablePick = true;
+  // 节流 PickFire 的鼠标移动拾取：pixel 模式每个 pointermove 都触发一次
+  // 单线程 compute（workgroup_size(1)）+ GPU 回读（mapAsync），高回报率鼠标
+  // （125Hz+）下会给 GPU 进程制造持续的小命令流——表现为"GPU 进程 CPU 打满、
+  // 硬件占用不高、帧率掉"。应用只用 PICK_CLICK，hover 拾取降到 100ms 一次。
+  const pickFire = view.pickFire as unknown as { onTouchMove: (event: unknown) => void };
+  const inputSystem = engine.inputSystem as unknown as {
+    removeEventListener: (type: string, listener: unknown, thisArg: unknown) => void;
+    addEventListener: (type: string, listener: unknown, thisArg: unknown) => void;
+  };
+  inputSystem.removeEventListener(PointerEvent3D.POINTER_MOVE, pickFire.onTouchMove, pickFire);
+  let lastMovePickAt = 0;
+  const throttledMovePick = (event: unknown): void => {
+    const now = performance.now();
+    if (now - lastMovePickAt < 100) return;
+    lastMovePickAt = now;
+    pickFire.onTouchMove(event);
+  };
+  inputSystem.addEventListener(PointerEvent3D.POINTER_MOVE, throttledMovePick, pickFire);
   (window as Window & { __view?: View3D }).__view = view;
 
   let lastPickAt = 0;
@@ -147,6 +166,9 @@ async function bootstrap(): Promise<void> {
       return;
     }
     const worldPos = data.worldPos;
+    // 注意：RTE 模式下 Picker_cs 的重建已自行加回相机位置（着色器里
+    // cameraPositionH/L 补偿），data.worldPos 就是绝对 ECEF，不要再加相机坐标，
+    // 否则半径翻倍、下面的椭球范围过滤会把所有命中误杀。
     // 防御性校验：pixel 拾取读回的是上一帧 GBuffer，背景像素（太空）解码为 meshID=0，
     // 本场景矩阵 0 属于相机对象（无 Collider，不会出现在 mouseEnableMap 里），
     // 正常不会命中；这里再按椭球半径范围过滤一次，杜绝垃圾坐标落到标记上。
