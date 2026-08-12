@@ -1,19 +1,31 @@
-import { Camera3D, Color, Engine3D, MeshRenderer, Object3D, PointerEvent3D, Ray, Scene3D, SphereGeometry, UnLitMaterial, Vector3, View3D } from '@orillusion/core';
-import { Cartographic, Cartesian3, Cartesian4, Ellipsoid, EllipsoidTerrainProvider, Matrix4 as CesiumMatrix4, WebMapTileServiceImageryProvider } from '@cesium/engine';
-import { configureGlobeRendering, Globe, GlobeComponent, GlobeControls } from '../src/index.js';
+import { Color, Engine3D, MeshRenderer, Object3D, PointerEvent3D, Scene3D, SphereGeometry, UnLitMaterial, Vector2, Vector3, View3D } from '@orillusion/core';
+import { Cartographic, Cartesian3, Ellipsoid, EllipsoidTerrainProvider, WebMapTileServiceImageryProvider } from '@cesium/engine';
+import { configureGlobeRendering, Globe, GlobeComponent, GlobeControls, ThreeConventionCamera3D } from '../src/index.js';
 
 /**
- * GPU 拾取坐标示例（Orillusion 官方 pick 管线，bound 模式）：
- *  - 地形瓦片挂 ColliderComponent + MeshColliderShape（Globe 内置），
- *    引擎 ColliderComponent.onEnable 自动注册进 enablePickerList；
- *  - `setting.pick.mode = 'bound'` 先设、`view.enablePick = true` 后开（PickFire.start 按当时 mode 初始化）；
- *  - 点击时 PickFire 用屏幕射线对 enablePickerList 里的 Collider 做 rayPick，
- *    命中后派发 PointerEvent3D.PICK_CLICK，data.worldPos 即命中点世界坐标（ECEF）。
+ * GPU 拾取坐标示例（Orillusion 官方 gpupick 管线，pixel 模式）：
+ *  - 引擎每帧的 COLOR pass 把场景不透明网格同时写入 color 与 compress GBuffer
+ *    （rgba32float）；压缩 GBuffer 的 w 通道按 r22g8 编码 (modelIndex, metallic)，
+ *    modelIndex 即对象世界矩阵池索引（Common_frag.modelIndex → packNHMDGBuffer）；
+ *  - 地形瓦片挂 ColliderComponent（Globe 内置，见 Globe.createTerrainObject），
+ *    组件 start() 时把 worldMatrix.index → collider 注册进 pickFire.mouseEnableMap；
+ *  - 点击时 PickFire 启动 Picker_cs 计算着色器，textureLoad 鼠标 UV 处的 GBuffer texel，
+ *    解码出 meshID 与命中点世界坐标（ECEF，与地形顶点同一参考系）并派发
+ *    PointerEvent3D.PICK_CLICK，data.worldPos 即命中点世界坐标；
+ *  - 前置条件：useLogDepth = true（ECEF 大尺度场景必需，否则非 log-depth 的
+ *    位置重建数值病态）与 useCompressGBuffer = true（上游 pixel 模式依赖压缩
+ *    GBuffer 携带对象 ID）、pick.mode = 'pixel' 都必须在 startRenderView 之前设置；
+ *    pixel 模式还会自动挂 FXAA。
  *
- * 注意：Orillusion 0.9.2 的 Camera3D.screenPointToRay 在默认透视参数下
- * 恒返回相机 forward（unproject 缺陷），这里在示例层用标准透视矩阵修复；
- * 不修改引擎源码、不开启压缩 GBuffer（pixel 模式前置，会与自定义瓦片材质冲突），
- * 对场景中其他几何零影响——它们没有 ColliderComponent，不参与拾取。
+ * 与 bound 模式（CPU 屏幕射线 vs Collider 包围体）的区别：
+ *  - 精度到像素，不依赖 Camera3D.screenPointToRay，也不需要射线-网格求交；
+ *  - 读回的是上一帧的渲染结果（GBuffer 与相机姿态滞后一帧，官方管线固有行为）；
+ *  - 背景像素（太空）解码为 meshID = 0 —— 本场景矩阵 0 属于相机对象（无 Collider，
+ *    矩阵索引在 Object3D 创建时按序分配），查询不到拾取对象，因此点击太空不会派发
+ *    PICK_CLICK，示例通过引擎输入系统补一个未命中提示。
+ *
+ * 控制器：1:1 移植的 3d-tiles-renderer GlobeControls（椭球拖拽/缩放/惯性/
+ * near-far 调节），内部自带射线数学，无需再修补 Camera3D.screenPointToRay。
  */
 
 const infoPanel = document.createElement('div');
@@ -22,7 +34,7 @@ document.body.appendChild(infoPanel);
 
 let marker: Object3D | null = null;
 
-/** 创建地表标记：红色小球，半径随相机高度缩放，保证任何视角可见。 */
+/** 创建地表标记：红色小球，半径随相机高度缩放，保证任何视角可见。无 Collider → 不参与拾取。 */
 function createMarker(engine: Engine3D, globe: Globe): Object3D {
   const object = new Object3D();
   const renderer = object.addComponent(MeshRenderer);
@@ -35,66 +47,15 @@ function createMarker(engine: Engine3D, globe: Globe): Object3D {
   return object;
 }
 
-/** Orillusion PICK_* 事件携带的拾取结果（bound 模式）。 */
+/** Orillusion PICK_* 事件携带的拾取结果（pixel 模式，PickFire.getPickInfo）。 */
 interface PickData {
-  /** 命中点世界坐标（ECEF，与地形瓦片顶点同一参考系）。 */
+  /** 命中点世界坐标（ECEF，由 GBuffer 深度 + 相机矩阵重建）。 */
   worldPos: Vector3;
   worldNormal: Vector3;
-  /** 命中网格的矩阵池索引（-1 表示未命中）。 */
+  /** 命中点屏幕像素坐标（Picker_cs 原样写回 globalUniform.mouseX/Y）。 */
+  screenUv: Vector2;
+  /** 命中网格的矩阵池索引（对象 ID；背景像素解码为 0）。 */
   meshID: number;
-  distance: number;
-}
-
-/**
- * 修复 Orillusion 0.9.2 Camera3D.screenPointToRay 的 unproject 缺陷
- * （其 projectionMatrix 布局非常规，屏幕射线恒等于相机 forward）。
- * 用 fov/aspect/near/far 重建标准透视矩阵（Cesium 数学），方向取反修正 NDC 符号。
- */
-function patchScreenPointToRay(camera: Camera3D): void {
-  const canvas = camera._boundCtx?.canvas;
-  if (!canvas) return;
-  camera.screenPointToRay = (clientX: number, clientY: number): Ray => {
-    const fov = (camera.fov * Math.PI) / 180;
-    const tanHalf = Math.tan(fov / 2);
-    const aspect = canvas.clientWidth / canvas.clientHeight;
-    const near = camera.near;
-    const far = camera.far;
-    // 标准 OpenGL 透视矩阵（列主序，与 Cesium Matrix4 布局一致）。
-    const proj = new CesiumMatrix4(
-      1 / (tanHalf * aspect), 0, 0, 0,
-      0, 1 / tanHalf, 0, 0,
-      0, 0, -(far + near) / (far - near), (-2 * far * near) / (far - near),
-      0, 0, -1, 0,
-    );
-    const wm = camera.object3D.transform.worldMatrix.rawData;
-    const world = new CesiumMatrix4(
-      wm[0], wm[4], wm[8], wm[12],
-      wm[1], wm[5], wm[9], wm[13],
-      wm[2], wm[6], wm[10], wm[14],
-      wm[3], wm[7], wm[11], wm[15],
-    );
-    const invViewProj = CesiumMatrix4.multiply(
-      world,
-      CesiumMatrix4.inverse(proj, new CesiumMatrix4()),
-      new CesiumMatrix4(),
-    );
-    const ndcX = (clientX / canvas.clientWidth) * 2 - 1;
-    // Orillusion 的 NDC y 与标准 OpenGL 相反（屏幕顶部 = NDC -1）：
-    // 用 2y/h-1 才能让屏幕上方射线指向北（相机 up 方向）。
-    const ndcY = (clientY / canvas.clientHeight) * 2 - 1;
-    const far4 = CesiumMatrix4.multiplyByVector(invViewProj, new Cartesian4(ndcX, ndcY, 1, 1), new Cartesian4());
-    if (Math.abs(far4.w) < 1e-12) return new Ray(new Vector3(), new Vector3(0, 0, -1));
-    const invW = 1 / far4.w;
-    const cameraPosition = camera.object3D.transform.worldPosition;
-    const origin = new Vector3(cameraPosition.x, cameraPosition.y, cameraPosition.z);
-    // 方向取反：Orillusion 的 NDC z 轴与标准 OpenGL 相反，取反后射线才指向场景。
-    const direction = new Vector3(
-      origin.x - far4.x * invW,
-      origin.y - far4.y * invW,
-      origin.z - far4.z * invW,
-    ).normalize();
-    return new Ray(origin, direction);
-  };
 }
 
 async function bootstrap(): Promise<void> {
@@ -104,18 +65,24 @@ async function bootstrap(): Promise<void> {
   const engine = await Engine3D.init();
   const scene = new Scene3D();
   const cameraObject = new Object3D();
-  const camera = cameraObject.addComponent(Camera3D);
+  // three.js 约定相机：GlobeControls 按 three 数学操作 transform，viewMatrix 层还原 fork 的 +z 前向。
+  const camera = cameraObject.addComponent(ThreeConventionCamera3D);
   camera.perspective(60, engine.aspect, 1, 100_000_000);
   // Cesium Camera.DEFAULT_VIEW_RECTANGLE 的中心约为经度 -82.5°、纬度 35°。
   const cesiumInitialPosition = Ellipsoid.WGS84.cartographicToCartesian(
     Cartographic.fromDegrees(-82.5, 35.0, 12_000_000),
   );
-  camera.lookAt(new Vector3(cesiumInitialPosition.x, cesiumInitialPosition.y, cesiumInitialPosition.z), Vector3.ZERO, new Vector3(0, 0, 1));
+  const initialPosition = new Vector3(cesiumInitialPosition.x, cesiumInitialPosition.y, cesiumInitialPosition.z);
+  camera.lookAt(initialPosition, Vector3.ZERO, new Vector3(0, 0, 1));
+  // 1:1 移植的 3d-tiles-renderer GlobeControls。minDistance 沿用原版语义：
+  // 相机到缩放点（地表）的最小距离，这里设为 100 m 允许放大到贴地高度。
   cameraObject.addComponent(GlobeControls, {
     camera,
     domElement: engine.context3D.canvas,
-    target: Vector3.ZERO,
-    minDistance: Ellipsoid.WGS84.maximumRadius + 100,
+    minDistance: 100,
+    // 关闭阻尼惯性：拖拽/旋转松开后立即停止，不做残余旋转（原版 enableDamping
+    // 会带球面惯性，松开后地球继续转一会）。
+    enableDamping: false,
   });
   scene.addChild(cameraObject);
 
@@ -140,32 +107,52 @@ async function bootstrap(): Promise<void> {
   });
   scene.addChild(globeObject);
 
+  // ---- 开启 Orillusion 官方 GPU 拾取（pixel 模式：逐像素 GBuffer 读回） ----
+  // 必须在 startRenderView 之前设置：PickFire.start / 渲染任务按当时 mode 初始化。
+  // useLogDepth 不是拾取开关，但必须开：near=1 / far=1e8 时地球表面全部挤在
+  // NDC z≈1 附近，非 log-depth 路径的 getWorldPosition(gBuffer.x, uv) 反投影
+  // 数值病态（w→0），解码出的世界坐标是垃圾值；log-depth 路径（GBufferStand 的
+  // inverseLog2Depth + 近平面射线重建，Picker_cs 同步切换）是数值稳健的。
+  engine.setting.render.useLogDepth = true;
+  engine.setting.render.useCompressGBuffer = true;
+  engine.setting.pick.mode = 'pixel';
+
   const view = new View3D();
   view.scene = scene;
-  view.camera = camera;
+  view.camera = camera as unknown as import('@orillusion/core').Camera3D;
   engine.startRenderView(view);
+  // mode==='pixel' 时渲染任务已自动开启拾取（并挂 FXAA）；显式再开一次是幂等的，
+  // 与官方 gpupick 示例的写法保持一致。
+  view.enablePick = true;
   (window as Window & { __view?: View3D }).__view = view;
 
-  // ---- 开启 Orillusion 官方拾取（bound 模式：ColliderComponent + 屏幕射线） ----
-  patchScreenPointToRay(camera);
-  engine.setting.pick.mode = 'bound';
-  view.enablePick = true;
+  let lastPickAt = 0;
 
   const onPick = (event: { data?: PickData }): void => {
+    lastPickAt = performance.now();
     const data = event.data;
-    if (!data || data.meshID < 0 || !marker) {
-      const renderer = marker?.getComponent(MeshRenderer);
+    const renderer = marker?.getComponent(MeshRenderer);
+    if (!data || !marker || data.meshID < 0) {
       if (renderer?.enable) renderer.enable = false;
       infoPanel.textContent = '未命中地球（射线指向太空）';
       return;
     }
     const worldPos = data.worldPos;
+    // 防御性校验：pixel 拾取读回的是上一帧 GBuffer，背景像素（太空）解码为 meshID=0，
+    // 本场景矩阵 0 属于相机对象（无 Collider，不会出现在 mouseEnableMap 里），
+    // 正常不会命中；这里再按椭球半径范围过滤一次，杜绝垃圾坐标落到标记上。
+    const radius = Cartesian3.magnitude(new Cartesian3(worldPos.x, worldPos.y, worldPos.z));
+    if (radius < Ellipsoid.WGS84.minimumRadius * 0.98 || radius > Ellipsoid.WGS84.maximumRadius * 1.02) {
+      if (renderer?.enable) renderer.enable = false;
+      infoPanel.textContent = '未命中地球（拾取坐标超出椭球表面范围）';
+      return;
+    }
     const cartographic = Cartographic.fromCartesian(
       new Cartesian3(worldPos.x, worldPos.y, worldPos.z),
       Ellipsoid.WGS84,
     );
-    // 标记放于命中点（Collider 命中点世界坐标，globe.group 无位移 → 直接可用）。
-    marker.getComponent(MeshRenderer)!.enable = true;
+    // 标记放于命中点（GBuffer 重建的世界坐标，globe.group 无位移 → 直接可用）。
+    renderer!.enable = true;
     marker.transform.localPosition = new Vector3(worldPos.x, worldPos.y, worldPos.z);
     const cameraPosition = camera.object3D.transform.worldPosition;
     const cameraHeight = Cartographic.fromCartesian(
@@ -177,16 +164,28 @@ async function bootstrap(): Promise<void> {
     const lon = (cartographic.longitude * 180) / Math.PI;
     const lat = (cartographic.latitude * 180) / Math.PI;
     infoPanel.textContent = [
-      '— 拾取结果（Orillusion bound pick）—',
+      '— 拾取结果（Orillusion pixel gpupick）—',
       `经度  ${lon.toFixed(6)}°`,
       `纬度  ${lat.toFixed(6)}°`,
       `高度  ${cartographic.height.toFixed(1)} m`,
       `ECEF   ${worldPos.x.toFixed(0)}, ${worldPos.y.toFixed(0)}, ${worldPos.z.toFixed(0)}`,
       `meshID ${data.meshID}`,
+      `UV     ${data.screenUv.x.toFixed(1)}, ${data.screenUv.y.toFixed(1)}`,
       `相机高度 ${(cameraHeight / 1000).toFixed(0)} km`,
     ].join('\n');
   };
   view.pickFire.addEventListener(PointerEvent3D.PICK_CLICK, onPick, undefined);
+
+  // 未命中反馈：pixel 模式下 PICK_CLICK 只在命中可拾取对象时派发，点击太空没有
+  // 任何 PICK_* 事件；借用引擎输入系统的 POINTER_CLICK（PickFire 的同名监听
+  // 先注册先执行）判断本次点击是否产生了拾取结果。
+  engine.inputSystem.addEventListener(PointerEvent3D.POINTER_CLICK, () => {
+    if (performance.now() - lastPickAt > 120) {
+      const renderer = marker?.getComponent(MeshRenderer);
+      if (renderer?.enable) renderer.enable = false;
+      infoPanel.textContent = '未命中地球（射线指向太空）';
+    }
+  }, undefined);
 
 }
 

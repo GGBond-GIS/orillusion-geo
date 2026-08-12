@@ -1,6 +1,6 @@
-import { Camera3D, Engine3D, Object3D, Scene3D, Vector3, View3D } from '@orillusion/core';
+import { Engine3D, Object3D, Scene3D, Vector3, View3D } from '@orillusion/core';
 import { Cartographic, Ellipsoid, EllipsoidTerrainProvider, WebMapTileServiceImageryProvider } from '@cesium/engine';
-import { configureGlobeRendering, Globe, GlobeComponent, GlobeControls } from '../src/index.js';
+import { configureGlobeRendering, Globe, GlobeComponent, GlobeControls, ThreeConventionCamera3D } from '../src/index.js';
 
 /** 启动地形影像 Globe 示例。 */
 async function bootstrap(): Promise<void> {
@@ -10,7 +10,8 @@ async function bootstrap(): Promise<void> {
   const engine = await Engine3D.init();
   const scene = new Scene3D();
   const cameraObject = new Object3D();
-  const camera = cameraObject.addComponent(Camera3D);
+  // three.js 约定相机：GlobeControls 按 three 数学操作 transform，viewMatrix 层还原 fork 的 +z 前向。
+  const camera = cameraObject.addComponent(ThreeConventionCamera3D);
   camera.perspective(60, engine.aspect, 1, 100_000_000);
   // Cesium Camera.DEFAULT_VIEW_RECTANGLE 的中心约为经度 -82.5°、纬度 35°。
   // 使用 Cesium WGS84 API 生成 ECEF 初始相机位置，确保与 Worker 输出的 TerrainMesh 坐标系一致。
@@ -22,8 +23,10 @@ async function bootstrap(): Promise<void> {
   cameraObject.addComponent(GlobeControls, {
     camera,
     domElement: engine.context3D.canvas,
-    target: Vector3.ZERO,
-    minDistance: Ellipsoid.WGS84.maximumRadius + 100,
+    // 原版语义：相机到缩放点（地表）的最小距离，100 m 允许放大到贴地高度。
+    minDistance: 100,
+    // 关闭阻尼惯性：拖拽/旋转松开后立即停止（原版 enableDamping 会带惯性继续转）。
+    enableDamping: false,
   });
   scene.addChild(cameraObject);
 
@@ -49,7 +52,7 @@ async function bootstrap(): Promise<void> {
   scene.addChild(globeObject);
   const view = new View3D();
   view.scene = scene;
-  view.camera = camera;
+  view.camera = camera as unknown as import('@orillusion/core').Camera3D;
   engine.startRenderView(view);
 }
 

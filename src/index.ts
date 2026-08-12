@@ -4,6 +4,12 @@ export { TilesRendererComponent, type TilesRendererComponentOptions } from './Re
 export { Globe, type GlobeOptions, type GlobeStatistics, type GlobeTileCoordinate } from './Globe/Globe.js';
 export { GlobeComponent, type GlobeComponentOptions } from './Globe/GlobeComponent.js';
 export { GlobeControls, type GlobeControlsOptions } from './Controls/GlobeControls.js';
+export { EnvironmentControls, type EnvironmentControlsOptions, NONE, DRAG, ROTATE, ZOOM, WAITING, FREE_ROTATE } from './Controls/EnvironmentControls.js';
+export { ThreeConventionCamera3D } from './Controls/ThreeConventionCamera3D.js';
+export { PointerTracker } from './Controls/PointerTracker.js';
+export { Ray as ControlsRay } from './Controls/Ray.js';
+export { Plane } from './Controls/Plane.js';
+export { Ellipsoid, WGS84_ELLIPSOID, WGS84_RADIUS, WGS84_HEIGHT } from './Math/Ellipsoid.js';
 export { GlobeReprojectionCompute, type GlobeReprojectionOptions } from './Renderer/GlobeReprojectionCompute.js';
 export { CesiumGlobeTileMaterial, type CesiumGlobeTileTexture } from './Renderer/CesiumGlobeTileMaterial.js';
 export { configureGlobeRendering, type GlobeRenderingConfiguration } from './Renderer/configureGlobeRendering.js';
