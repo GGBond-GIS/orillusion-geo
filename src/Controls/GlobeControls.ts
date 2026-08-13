@@ -1,6 +1,7 @@
 import { Camera3D, Matrix4, Object3D, Quaternion, Vector2, Vector3 } from '@orillusion/core';
 import { Ellipsoid, WGS84_ELLIPSOID } from '../Math/Ellipsoid.js';
 import { DRAG, EnvironmentControls, FREE_ROTATE, NONE, ZOOM, type EnvironmentControlsOptions } from './EnvironmentControls.js';
+import { fwdDotEarth, uvOf } from './controlsDebug.js';
 import { Ray } from './Ray.js';
 import { adjustedPointerToCoords, clamp, lerp, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera } from './controlsUtils.js';
 
@@ -27,6 +28,8 @@ const _toCenter = new Vector3();
 const _ray = new Ray();
 const _ellipsoid = new Ellipsoid();
 const _pointer = new Vector2();
+/** 黑屏检测用的相机前向暂存(仅 debug 开启时使用)。 */
+const _debugForward = new Vector3();
 /** adjustCamera 用的经纬度暂存（getPositionToCartographic 返回弧度）。 */
 const _latLon: { lon: number; lat: number; height: number } = { lon: 0, lat: 0, height: 0 };
 /** adjustCamera 计算地平线距离时的最低海拔（与原版一致，避免贴地时 far 过近）。 */
@@ -160,6 +163,14 @@ export class GlobeControls extends EnvironmentControls {
     if (!this.enabled || !this.camera || deltaTime === 0) return;
 
     const { camera } = this;
+
+    // 调试:黑屏检测(相机朝向偏离地球时告警)。关闭 debug 时 debugLog 为
+    // null,此分支完全不执行,不产生任何数学计算。
+    if (this.debugLog) {
+      const pos = this.getCameraPosition();
+      const f = _debugForward.set(0, 0, 1).transformDirection(this.getCameraWorldMatrix());
+      this.debugLog.checkBlackScreen(pos, f);
+    }
 
     // 过渡阈值之外时，移动相机过程中切换重定向行为。
     if (this._isNearControls()) {
@@ -394,6 +405,17 @@ export class GlobeControls extends EnvironmentControls {
       // 应用旋转。
       this.applyCameraMatrixFrom(_rotMatrix);
 
+      // 调试:左键拖拽步进量(四元数/枢轴/相机位置)。惰性求值,关闭时零开销。
+      this.debugLog?.steps(() => {
+        const pos = this.getCameraPosition();
+        const q = _quaternion;
+        return (
+          `[CTRL] drag q=(${q.x.toFixed(3)},${q.y.toFixed(3)},${q.z.toFixed(3)},${q.w.toFixed(3)})` +
+          ` pivot=(${pivotPoint.x.toFixed(0)},${pivotPoint.y.toFixed(0)},${pivotPoint.z.toFixed(0)})` +
+          ` pos=(${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z.toFixed(0)})`
+        );
+      });
+
       if (pointerTracker.getMoveDistance() / deltaTime < 2 * window.devicePixelRatio) {
         this.inertiaStableFrames++;
       } else {
@@ -474,16 +496,41 @@ export class GlobeControls extends EnvironmentControls {
       this._tiltTowardsCenter(lerp(0, 0.4, distanceAlpha * deltaAlpha));
       this._alignCameraUpToNorth(lerp(0, 0.2, distanceAlpha * deltaAlpha));
 
-      // 以与环境控制类似的方式计算缩放，保证缩放速度可比。
-      const dist = this.getDistanceToCenter() - this._getMaxWorldRadius();
-      const scale = zoomDelta * dist * zoomSpeed * 0.0025;
-      const clampedScale = Math.max(scale, Math.min(this.getDistanceToCenter() - maxDistance, 0));
+      // 判空：指针射线未命中地球（指向太空/地平线外）时不移动相机——高空
+      // 拉远时地球在画面中占比很小，没拾取到就不该继续缩放。
+      this._updateZoomDirection();
+      if (this.zoomPointSet || this._updateZoomPoint()) {
+        // 以与环境控制类似的方式计算缩放，保证缩放速度可比。
+        const dist = this.getDistanceToCenter() - this._getMaxWorldRadius();
+        const scale = zoomDelta * dist * zoomSpeed * 0.0025;
+        // zoom-out 下限：不超过 maxDistance；zoom-in 上限：不越过地表
+        // （minDistance 余量）。防快速滚动/动量缩放一帧把相机甩过地球。
+        const surfaceDist = this.getDistanceToCenter() - this._getMaxWorldRadius() - this.minDistance;
+        const clampedScale = Math.max(
+          Math.min(scale, surfaceDist),
+          Math.min(this.getDistanceToCenter() - maxDistance, 0),
+        );
 
-      // 直接沿球心方向缩放。
-      this.getVectorToCenter(_vec).normalize();
-      this.getCameraPosition().addScaledVector(_vec, clampedScale);
-      this.getCameraTransform().notifyLocalChange();
-      this.getCameraTransform().updateWorldMatrix();
+        // 直接沿球心方向缩放。
+        this.getVectorToCenter(_vec).normalize();
+        this.getCameraPosition().addScaledVector(_vec, clampedScale);
+        this.getCameraTransform().notifyLocalChange();
+        this.getCameraTransform().updateWorldMatrix();
+
+        // 调试:远区分支缩放步进量。惰性求值,关闭时零开销。
+        this.debugLog?.steps(() => {
+          const pos = this.getCameraPosition();
+          const f = new Vector3(0, 0, 1).transformDirection(this.getCameraWorldMatrix());
+          return (
+            `[CTRL] zoomFar scale=${clampedScale.toFixed(0)} hit=(${zoomPoint.x.toFixed(0)},${zoomPoint.y.toFixed(0)},${zoomPoint.z.toFixed(0)})` +
+            ` uv=${uvOf(zoomPoint)} fwd=${fwdDotEarth(pos, f).toFixed(3)}` +
+            ` pos=(${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z.toFixed(0)})`
+          );
+        });
+      } else {
+        // 调试:远区分支未命中(判空,不移动)。
+        this.debugLog?.steps(() => '[CTRL] zoomFar noHit (不移动)');
+      }
 
       this.zoomDelta = 0;
     }

@@ -1,5 +1,7 @@
-import { CameraType, ComponentBase, Context3D, Frustum, Matrix4, Quaternion, Rect, Vector3, View3D } from '@orillusion/core';
-import type { ILight } from '@orillusion/core';
+import { CameraType, ComponentBase, Context3D, Frustum, Matrix4, Quaternion, Ray, Rect, Vector3, View3D } from '@orillusion/core';
+import type { Camera3D, ILight } from '@orillusion/core';
+import { setRayFromCamera } from './controlsUtils.js';
+import type { Ray as ControlsRay } from './Ray.js';
 
 /**
  * three.js 约定相机（独立组件，不继承 Camera3D）。
@@ -52,6 +54,7 @@ export class ThreeConventionCamera3D extends ComponentBase {
   private _unprojection = new Matrix4();
   private _pvMatrixInv = new Matrix4();
   private _pvMatrix = new Matrix4();
+  private _ray = new Ray();
 
   private _forkView = new Matrix4();
 
@@ -196,6 +199,38 @@ export class ThreeConventionCamera3D extends ComponentBase {
     target.x = target.x * halfW + halfW;
     target.y = halfH - target.y * halfH;
     return target;
+  }
+
+  /**
+   * 屏幕像素坐标（元素相对，CSS px，y 向下）→ 世界射线（origin = 相机位置，
+   * direction 归一化）。与引擎 Camera3D.screenPointToRay 同签名同输入约定：
+   * PickFire（bound 拾取）/ TransformController 等引擎路径按此调用。
+   *
+   * 注意引擎自带 Camera3D.screenPointToRay 在本 fork 中不可信（UnProjection
+   * 矩阵乘法顺序为 invProj·world，顺序错误），因此这里直接复用已用 pixel 拾取
+   * 逐点标定的 setRayFromCamera 数学（NDC y 翻转 + 平移清零视图先求逆），
+   * bound 拾取射线与 GPU 拾取重建方向精确一致。
+   *
+   * 返回引擎 Ray（而非本仓库 Controls/Ray）：引擎 ColliderShape.rayPick 会
+   * 对传入射线做 Ray.copy（读取内部 _dir/length 字段）再 applyMatrix/
+   * intersectBox/intersectTriangle，只有引擎 Ray 的字段与方法齐备。
+   */
+  screenPointToRay(viewPortPosX: number, viewPortPosY: number): Ray {
+    const ctx = this._boundCtx ?? this.transform.scene3D?.view?.engine3D?.context3D;
+    const canvas = ctx?.canvas;
+    // 与引擎 CameraUtil.UnProjection 同一约定：按 canvas 客户端尺寸（CSS px）
+    // 换算 NDC；canvas 未就绪时退回 viewPort（设备 px，pixelRatio=1 时等价）。
+    const width = canvas?.clientWidth || this.viewPort.width;
+    const height = canvas?.clientHeight || this.viewPort.height;
+    if (!width || !height) return this._ray;
+    const ndcX = (viewPortPosX / width) * 2 - 1;
+    const ndcY = 1 - (viewPortPosY / height) * 2;
+    setRayFromCamera(this._ray as unknown as ControlsRay, { x: ndcX, y: ndcY }, this as unknown as Camera3D);
+    // setRayFromCamera 只保证方向指向正确、不保证单位长度；引擎拾取路径的
+    // 求交距离（pointAt/intersectTriangle 的 t）依赖归一化方向，与引擎
+    // Camera3D.screenPointToRay 的 end.sub(start).normalize() 保持一致。
+    this._ray.direction.normalize();
+    return this._ray;
   }
 
   override destroy(force?: boolean): void {

@@ -2,6 +2,7 @@ import { Camera3D, ColliderComponent, Color, ComponentBase, Matrix4, MeshRendere
 import { PointerTracker } from './PointerTracker.js';
 import { Plane } from './Plane.js';
 import { Ray } from './Ray.js';
+import { ControlsDebug, fwdDotEarth, uvOf, type DebugLogOptions } from './controlsDebug.js';
 import { adjustedPointerToCoords, clamp, decomposeMatrix4, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera } from './controlsUtils.js';
 
 export const NONE = 0;
@@ -78,6 +79,8 @@ export interface EnvironmentControlsOptions {
   autoAdjustCameraRotation?: boolean;
   scaleZoomOrientationAtEdges?: boolean;
   enabled?: boolean;
+  /** 调试日志:传 true 开启全部,或传对象按项开启(默认关闭,零开销)。 */
+  debug?: boolean | DebugLogOptions;
 }
 
 /**
@@ -149,6 +152,8 @@ export class EnvironmentControls extends ComponentBase {
   public inertiaStableFrames = 0;
 
   public up = new Vector3(0, 1, 0);
+  /** 调试日志实例;未开启 debug 时为 null,调用点经可选链短路,零开销。 */
+  public debugLog: ControlsDebug | null = null;
   private _lastTime = performance.now();
   private _keysDown = new Set<string>();
   private _detachCallback: (() => void) | null = null;
@@ -182,6 +187,10 @@ export class EnvironmentControls extends ComponentBase {
     if (options.autoAdjustCameraRotation !== undefined) this.autoAdjustCameraRotation = options.autoAdjustCameraRotation;
     if (options.scaleZoomOrientationAtEdges !== undefined) this.scaleZoomOrientationAtEdges = options.scaleZoomOrientationAtEdges;
     if (options.enabled !== undefined) this.enabled = options.enabled;
+    // 调试日志:true 开全部,对象按项开;缺省为 null(关闭,零开销)。
+    if (options.debug) {
+      this.debugLog = new ControlsDebug(options.debug === true ? undefined : options.debug);
+    }
 
     // 等价于原版构造函数里的 init 段。
     if (this.domElement && !this._detachCallback) this.attach(this.domElement);
@@ -330,31 +339,44 @@ export class EnvironmentControls extends ComponentBase {
         return;
       }
 
-      // 求命中点。
+      // 求命中点。判空：左键拖拽与右键旋转都必须在命中点存在时才进入——
+      // 未命中（点击太空/地平线外）直接结束，否则会绕垃圾枢轴旋转/拖拽，
+      // 相机被带飞。
       const hit = this._raycast(_ray);
-      if (hit) {
-        // 双指 / 右键 / shift+左键 → 旋转。
-        if (
-          pointerTracker.getPointerCount() === 2 ||
-          pointerTracker.isRightClicked() ||
-          (pointerTracker.isLeftClicked() && event.shiftKey)
-        ) {
-          // 绕点旋转的绕点 = 屏幕中心点（相机视线与椭球/场景的交点，即
-          // GlobeControls.getPivotPoint 的中心逻辑），而不是鼠标按下点——
-          // 否则在非屏幕中心处按下时，轨道绕屏幕边缘的点转，视角会闪动/漂移；
-          // 中心点配合 _alignCameraUp/_clampRotation 的固定点补偿，旋转全程
-          // 把屏幕中心锁死在视野中央（Cesium target 同款手感）。
-          setRayFromCamera(_ray, _screenCenter, camera);
-          const centerHit = this._raycast(_ray);
-          const rotatePoint = centerHit ? centerHit.point : hit.point;
-          pivotPoint.copy(rotatePoint);
-          this.placePivotMesh(rotatePoint, pointerTracker.isPointerTouch() ? false : enabled);
-          this.setState(pointerTracker.isPointerTouch() ? WAITING : ROTATE);
-        } else if (pointerTracker.isLeftClicked()) {
-          pivotPoint.copy(hit.point);
-          this.placePivotMesh(hit.point, false);
-          this.setState(DRAG);
-        }
+      // 调试:按下事件的命中信息与 uv(经纬度等距柱状映射)。
+      this.debugLog?.steps(() =>
+        hit
+          ? `[CTRL] down hit=(${hit.point.x.toFixed(0)},${hit.point.y.toFixed(0)},${hit.point.z.toFixed(0)}) dist=${hit.distance.toFixed(0)} uv=${uvOf(hit.point)}`
+          : `[CTRL] down noHit right=${pointerTracker.isRightClicked()} left=${pointerTracker.isLeftClicked()}`,
+      );
+      if (!hit) return;
+
+      // 双指 / 右键 / shift+左键 → 旋转。
+      if (
+        pointerTracker.getPointerCount() === 2 ||
+        pointerTracker.isRightClicked() ||
+        (pointerTracker.isLeftClicked() && event.shiftKey)
+      ) {
+        // 绕点旋转的绕点 = 屏幕中心点（相机视线与椭球/场景的交点，即
+        // GlobeControls.getPivotPoint 的中心逻辑），而不是鼠标按下点——
+        // 否则在非屏幕中心处按下时，轨道绕屏幕边缘的点转，视角会闪动/漂移；
+        // 中心点配合 _alignCameraUp/_clampRotation 的固定点补偿，旋转全程
+        // 把屏幕中心锁死在视野中央（Cesium target 同款手感）。
+        setRayFromCamera(_ray, _screenCenter, camera);
+        const centerHit = this._raycast(_ray);
+        const rotatePoint = centerHit ? centerHit.point : hit.point;
+        pivotPoint.copy(rotatePoint);
+        // 调试:右键旋转的 pivot。
+        this.debugLog?.steps(() => {
+          const pr = Math.sqrt(rotatePoint.x ** 2 + rotatePoint.y ** 2 + rotatePoint.z ** 2);
+          return `[CTRL] downRot pivot=(${rotatePoint.x.toFixed(0)},${rotatePoint.y.toFixed(0)},${rotatePoint.z.toFixed(0)}) pivotR=${pr.toFixed(0)}`;
+        });
+        this.placePivotMesh(rotatePoint, pointerTracker.isPointerTouch() ? false : enabled);
+        this.setState(pointerTracker.isPointerTouch() ? WAITING : ROTATE);
+      } else if (pointerTracker.isLeftClicked()) {
+        pivotPoint.copy(hit.point);
+        this.placePivotMesh(hit.point, false);
+        this.setState(DRAG);
       }
     };
 
@@ -451,6 +473,8 @@ export class EnvironmentControls extends ComponentBase {
       const deltaSign = Math.sign(delta);
       const normalizedDelta = Math.abs(delta);
       this.zoomDelta -= 0.25 * deltaSign * normalizedDelta;
+      // 调试:滚轮事件与累积的缩放量。
+      this.debugLog?.steps(() => `[CTRL] wheel deltaY=${event.deltaY.toFixed(0)} zoomDelta=${this.zoomDelta.toFixed(1)}`);
       this.needsUpdate = true;
 
       this._lastUsedState = ZOOM;
@@ -576,6 +600,8 @@ export class EnvironmentControls extends ComponentBase {
 
   public resetState(): void {
     if (this.state !== NONE) {
+      // 调试:状态复位。
+      this.debugLog?.steps(() => `[CTRL] state ${this.state}→NONE (reset)`);
       this.dispatchEvent(_endEvent);
     }
     this.state = NONE;
@@ -586,6 +612,9 @@ export class EnvironmentControls extends ComponentBase {
 
   public setState(state: number = this.state, fireEvent = true): void {
     if (this.state === state) return;
+
+    // 调试:状态切换。
+    this.debugLog?.steps(() => `[CTRL] state ${this.state}→${state}`);
 
     if (this.state === NONE && fireEvent) {
       this.dispatchEvent(_startEvent);
@@ -931,9 +960,6 @@ export class EnvironmentControls extends ComponentBase {
     // 初始化缩放方向。
     this._updateZoomDirection();
 
-    // 跟踪将要使用的缩放方向。
-    const finalZoomDirection = _vec.copy(zoomDirection);
-
     if (this.zoomPointSet || this._updateZoomPoint()) {
       const dist = zoomPoint.distanceTo(this.getCameraPosition());
 
@@ -948,16 +974,32 @@ export class EnvironmentControls extends ComponentBase {
         scale = Math.min(scale, remainingDistance);
       }
 
+      // 单帧缩放上限（缩放距离的 30%，≈4 个滚轮档位/帧）：快速滚动或触控板
+      // 动量会在一帧内累积大量 zoomDelta，若不限制，相机可沿指针射线一帧冲到
+      // 缩放点——钻入地表或越过地平线（“缩放时相机飞走”）。正常单档缩放
+      // （7.5%/档）不受影响。
+      const maxScale = 0.3 * dist;
+      scale = Math.max(Math.min(scale, maxScale), -maxScale);
+
       this.getCameraPosition().addScaledVector(zoomDirection, scale);
       this.getCameraTransform().notifyLocalChange();
       this.getCameraTransform().updateWorldMatrix();
-    } else {
-      // 没有命中任何东西时按缩放方向直接移动（原版的"按地面距离缩放"分支
-      // 依赖 _getPointBelowCamera 相机碰撞逻辑，已随碰撞一并移除）。
-      this.getCameraPosition().addScaledVector(finalZoomDirection, scale);
-      this.getCameraTransform().notifyLocalChange();
-      this.getCameraTransform().updateWorldMatrix();
+
+      // 调试:缩放步进量与相机状态(惰性求值,关闭时零开销)。
+      this.debugLog?.steps(() => {
+        const p = this.getCameraPosition();
+        const f = new Vector3(0, 0, 1).transformDirection(this.getCameraWorldMatrix());
+        return (
+          `[CTRL] zoom scale=${scale.toFixed(0)} dir=(${zoomDirection.x.toFixed(3)},${zoomDirection.y.toFixed(3)},${zoomDirection.z.toFixed(3)})` +
+          ` zoomPt=(${this.zoomPoint.x.toFixed(0)},${this.zoomPoint.y.toFixed(0)},${this.zoomPoint.z.toFixed(0)})` +
+          ` uv=${uvOf(this.zoomPoint)} fwd=${fwdDotEarth(p, f).toFixed(3)}` +
+          ` pos=(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`
+        );
+      });
     }
+    // 判空：指针射线未命中任何物体（指向太空/地平线外）时不移动相机，避免
+    // “没拾取到也计算”导致的相机飞走。原版此分支按缩放方向直移，依赖
+    // _getPointBelowCamera 相机碰撞逻辑，已随碰撞一并移除。
   }
 
   protected _updateZoomDirection(): void {
@@ -967,7 +1009,23 @@ export class EnvironmentControls extends ComponentBase {
     const { domElement, zoomDirection, pointerTracker } = this;
     const camera = this.camera;
     if (!domElement || !camera) return;
+
+    // 缩放方向跟随鼠标（zoom to cursor）：方向 = 鼠标位置射线。
+    // 注意：快速移动后鼠标射线指向地球边缘/地平线外时，缩放会斜飞越过
+    // 地球边缘导致黑屏（见“快速移动后缩放飞走”的实测日志），由调用方
+    // （_updateZoom/_updateZoomPoint）的命中判空与方向限制兜底。
     pointerTracker.getLatestPoint(_pointer);
+    // 调试:方向重算的指针来源(排查“快速移动后缩放用旧方向”)。
+    this.debugLog?.zoomSource(() => {
+      const order0 = pointerTracker.pointerOrder[0];
+      const pos = pointerTracker.pointerPositions[order0];
+      return (
+        `[CTRL] zoomDirRecomp ptr=(${_pointer.x.toFixed(0)},${_pointer.y.toFixed(0)})` +
+        ` hover=(${pointerTracker.hoverPosition.x.toFixed(0)},${pointerTracker.hoverPosition.y.toFixed(0)})` +
+        ` ptrType=${pointerTracker.pointerType} order=[${pointerTracker.pointerOrder.join(',')}]` +
+        ` ptrPos=${pos ? `(${pos.x.toFixed(0)},${pos.y.toFixed(0)})` : 'none'}`
+      );
+    });
     adjustedPointerToCoords(_pointer, domElement, _pointer);
     setRayFromCamera(_ray, _pointer, camera);
     zoomDirection.copy(_ray.direction).normalize();
@@ -1078,7 +1136,40 @@ export class EnvironmentControls extends ComponentBase {
       pointerTracker.getPreviousCenterPoint(_prevPointer);
       _deltaPointer.subVectors(_pointer, _prevPointer).multiplyScalar((2 * Math.PI) / this.domElement!.clientHeight);
 
+      // 单帧旋转上限（0.75 rad ≈ 43°）：大场景渲染卡顿导致帧率骤降时，一帧内
+      // 会累积大量 pointermove，若不限制，相机沿绕点轨道一帧甩出巨大弧长——
+      // “快速旋转一下相机就飞到别处”。按帧而非按时间限制（帧率越低旋转越
+      // 保守）；超出部分丢弃（prevPointer 每帧滚动到最新指针位置），松开即停、
+      // 无惯性残留。正常拖拽每帧旋转量远低于上限，1:1 不受影响。
+      const maxRotationStep = 0.75;
+      const rotationStep = _deltaPointer.length();
+      // ---- 临时调试:截断前的原始步进量(调试完删除) ----
+      const __rawX = _deltaPointer.x;
+      const __rawY = _deltaPointer.y;
+      if (rotationStep > maxRotationStep) {
+        _deltaPointer.multiplyScalar(maxRotationStep / rotationStep);
+      }
+
       this._applyRotation(_deltaPointer.x, _deltaPointer.y, pivotPoint);
+
+      // 调试:每一步的旋转步进量(排查“快速旋转相机飞走”)。CLIPPED 表示
+      // 该帧旋转量超过单帧上限被截断。惰性求值,关闭时零开销。
+      if (__rawX !== 0 || __rawY !== 0) {
+        this.debugLog?.steps(() => {
+          const pos = this.getCameraPosition();
+          const dist = Math.sqrt(pos.x ** 2 + pos.y ** 2 + pos.z ** 2);
+          const pivotDist = Math.sqrt(
+            (pos.x - pivotPoint.x) ** 2 + (pos.y - pivotPoint.y) ** 2 + (pos.z - pivotPoint.z) ** 2,
+          );
+          const f = new Vector3(0, 0, 1).transformDirection(this.getCameraWorldMatrix());
+          const clipped = rotationStep > maxRotationStep ? ' CLIPPED' : '';
+          return (
+            `[CTRL] rot raw=(${__rawX.toFixed(3)},${__rawY.toFixed(3)}) step=(${_deltaPointer.x.toFixed(3)},${_deltaPointer.y.toFixed(3)})` +
+            ` pos=(${pos.x.toFixed(0)},${pos.y.toFixed(0)},${pos.z.toFixed(0)})` +
+            ` dist=${dist.toFixed(0)} pivotDist=${pivotDist.toFixed(0)} fwd=${fwdDotEarth(pos, f).toFixed(3)}${clipped}`
+          );
+        });
+      }
 
       // 更新旋转惯性。
       _deltaPointer.multiplyScalar(1 / deltaTime);
@@ -1297,6 +1388,14 @@ export class EnvironmentControls extends ComponentBase {
     // 用 -x（= three 的 +x），否则贴地时 signed angle 变负触发 minAltitude
     // 夹取，把相机 +z 强行转到 up 方向 → 相机翻转背对地球。
     _right.set(-1, 0, 0).transformDirection(this.getCameraWorldMatrix());
+
+    // 正俯视保护：相机后向与 up（径向）接近时（夹角 < ~25.8°）跳过夹取。
+    // 此时 cross(up, 后向) 退化，sign 在 ±1 间抖动，angle 会在 ±小角度间
+    // 跳动；负值会误触发 minAltitude（=0）夹取，整矩阵替换相机旋转
+    // （前向 = up → 背对地球）。实测：zoom-in 到缩放点正上方时后向·up=
+    // 0.988（9.45°），fwd 一帧从 1.0 翻到 -1.0（黑屏）。正俯视是缩放
+    // 到正上方的正常状态，无需夹取。
+    if (up.dot(_forward) > 0.9) return;
 
     // 相对俯视视角的有符号角度。
     let angle: number;
