@@ -458,6 +458,22 @@ export class GlobeControls extends EnvironmentControls {
     // 根据缩放强度缩放倾斜过渡。
     const deltaAlpha = clamp(mapLinear(Math.abs(zoomDelta), 0, 20, 0, 1), 0, 1);
 
+    // 未命中也要缩放（2026-08-14 用户要求）：命中（场景或椭球，见 _raycast 回退）
+    // 时方向 = 鼠标射线（zoom to cursor，既有手感不变）；未命中 = 射线指向太空/
+    // 地平线外（地球占屏很小、指针在地球盘外时常见），此时退化沿"指向椭球中心"
+    // 方向缩放——沿鼠标射线直移会斜飞越过地球边缘（曾致黑屏），球心方向是唯一
+    // 不会飞走的缩放方向。zoomPoint 取球心方向上的地表距离点，供剩余距离钳制与
+    // up 对齐（_setFrame）使用。
+    this._updateZoomDirection();
+    if (!this.zoomPointSet && !this._updateZoomPoint()) {
+      const fallbackDistance = Math.max(this.getDistanceToCenter() - this._getMaxWorldRadius(), this.minDistance);
+      this.getVectorToCenter(_vec).normalize();
+      this.zoomDirection.copy(_vec);
+      this.zoomDirectionSet = true;
+      this.zoomPoint.copy(this.getCameraPosition()).addScaledVector(_vec, fallbackDistance);
+      this.zoomPointSet = true;
+    }
+
     if (this._isNearControls() || zoomDelta > 0) {
       this._updateZoomDirection();
 
