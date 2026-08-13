@@ -1,37 +1,8 @@
-import { Cartesian3, Cartographic, type BoundingSphere, type Rectangle, type TerrainProvider, type TilingScheme } from '@cesium/engine';
+import { BoundingSphere, Cartesian3, Cartographic, type Rectangle, type TerrainProvider, type TilingScheme } from '@cesium/engine';
 // @ts-expect-error Cesium 将 Globe 使用的 EllipsoidalOccluder 保留在 Source 内部，运行时代码随 engine 包发布。
 import EllipsoidalOccluder from '@cesium/engine/Source/Core/EllipsoidalOccluder.js';
 import type { Camera3D } from '@orillusion/core';
 import type { TerrainTileKey } from './TerrainTileState.js';
-
-/**
- * 对齐 Cesium TileSelectionResult：记录瓦片上一帧被选择的结果。
- * KICK 位叠加在 RENDERED/REFINED 之上；originalResult() 剥离 KICK 位。
- */
-const SelectionResult = {
-  NONE: 0,
-  CULLED: 1,
-  RENDERED: 2,
-  REFINED: 3,
-  RENDERED_AND_KICKED: 6,
-  REFINED_AND_KICKED: 7,
-  CULLED_BUT_NEEDED: 9,
-} as const;
-
-/** 剥离 KICK/CULLED_BUT_NEEDED 叠加位，得到原始选择结果。 */
-function originalResult(value: number): number {
-  return value & 3;
-}
-
-/** 是否被 KICK（RENDERED_AND_KICKED / REFINED_AND_KICKED）。 */
-function wasKicked(value: number): boolean {
-  return value >= SelectionResult.RENDERED_AND_KICKED;
-}
-
-/** 叠加 KICK 位。 */
-function kick(value: number): number {
-  return value | 4;
-}
 
 /** 与 Cesium Intersect 一致的球体-平面求交结果。 */
 const Intersect = { OUTSIDE: -1, INTERSECTING: 0, INSIDE: 1 } as const;
@@ -109,27 +80,28 @@ export interface GlobeTraversalResult {
   culledButNeededKeys: Set<string>;
 }
 
-/** 遍历期间一棵子树的就绪汇总，对齐 Cesium TraversalDetails。 */
-class TraversalDetails {
-  public allAreRenderable = true;
-  public anyWereRenderedLastFrame = false;
-  public notYetRenderableCount = 0;
-
-  public static combine(details: TraversalDetails[]): TraversalDetails {
-    const result = new TraversalDetails();
-    result.allAreRenderable = details.every(item => item.allAreRenderable);
-    result.anyWereRenderedLastFrame = details.some(item => item.anyWereRenderedLastFrame);
-    result.notYetRenderableCount = details.reduce((sum, item) => sum + item.notYetRenderableCount, 0);
-    return result;
-  }
-}
-
-/** 瓦片在四叉树内的持久状态：上一帧选择结果、本帧距离与加载优先级、瓦片矩形缓存。 */
+/**
+ * 3d-tiles-renderer traversal state 的地形四叉树适配。
+ * active 表示本帧 REPLACE 前沿，visible 表示 active 且资源已可绘制。
+ */
 interface TraversalTileState {
   key: string;
-  result: number;
-  resultFrame: number;
+  lastFrameVisited: number;
+  used: boolean;
+  usedLastFrame: boolean;
+  active: boolean;
+  wasActive: boolean;
+  visible: boolean;
+  wasVisible: boolean;
+  inFrustum: boolean;
+  isLeaf: boolean;
+  refined: boolean;
+  wasRefined: boolean;
+  allChildrenReady: boolean;
+  allChildrenLoaded: boolean;
+  kicked: boolean;
   distance: number;
+  error: number;
   priority: number;
   rectangle: Rectangle | null;
 }
@@ -161,6 +133,7 @@ interface TraversalContext {
   loadQueueLow: TerrainTileKey[];
   touchedKeys: Set<string>;
   culledButNeededKeys: Set<string>;
+  queuedLoads: Set<string>;
 }
 
 const scratchTileDirection = new Cartesian3();
@@ -259,6 +232,7 @@ export class GlobeQuadtree {
       loadQueueLow: [],
       touchedKeys: new Set<string>(),
       culledButNeededKeys: new Set<string>(),
+      queuedLoads: new Set<string>(),
     };
     this.updateFrameContext();
     this.debugCounts.visited = 0;
@@ -276,17 +250,13 @@ export class GlobeQuadtree {
       return Cartesian3.distance(this.cameraPosition, centerA) - Cartesian3.distance(this.cameraPosition, centerB);
     });
 
-    for (const root of roots) {
-      const key = this.tileKey(root);
-      ctx.touchedKeys.add(key);
-      if (!this.accessorOf(root, ctx).fullyRenderable) {
-        // 根瓦片还不可渲染：直接高优先级加载，让地球尽快出现。
-        const state = this.ensureState(root);
-        this.queueTileLoad(ctx, ctx.loadQueueHigh, root, state);
-      } else {
-        this.visitIfVisible(root, ctx, false, new TraversalDetails());
-      }
-    }
+    // 3d-tiles-renderer runTraversal 的四段语义：
+    // markUsedTiles -> markUsedSetLeaves -> markVisibleTiles -> toggle/collectTiles。
+    // 多个 level-zero 根节点等价于一个无内容的虚拟根，因此逐根执行前三段，最后统一收集。
+    for (const root of roots) this.markUsedTiles(root, ctx);
+    for (const root of roots) this.markUsedSetLeaves(root, ctx);
+    for (const root of roots) this.markVisibleTiles(root, ctx);
+    for (const root of roots) this.collectTiles(root, ctx);
 
     // 对齐 Cesium processTileLoadQueue：队列按加载优先级排序（低值先加载）。
     ctx.loadQueueHigh.sort((a, b) => this.stateOf(a).priority - this.stateOf(b).priority);
@@ -310,8 +280,9 @@ export class GlobeQuadtree {
    */
   public wasRenderedLastFrame(key: string, frameNumber: number): boolean {
     const state = this.states.get(key);
-    if (!state || state.resultFrame !== frameNumber - 1) return false;
-    return originalResult(state.result) === SelectionResult.RENDERED;
+    if (!state) return false;
+    if (state.lastFrameVisited === frameNumber) return state.wasActive;
+    return state.lastFrameVisited === frameNumber - 1 && state.active;
   }
 
   /**
@@ -320,8 +291,9 @@ export class GlobeQuadtree {
    */
   public wasRefinedLastFrame(key: string, frameNumber: number): boolean {
     const state = this.states.get(key);
-    if (!state || state.resultFrame !== frameNumber - 1) return false;
-    return originalResult(state.result) === SelectionResult.REFINED;
+    if (!state) return false;
+    if (state.lastFrameVisited === frameNumber) return state.wasRefined;
+    return state.lastFrameVisited === frameNumber - 1 && state.refined;
   }
 
   /** 生成内部瓦片键。 */
@@ -344,6 +316,7 @@ export class GlobeQuadtree {
   }
 
   /** 对齐 Cesium QuadtreePrimitive.visitTile。 */
+  /* Legacy Cesium traversal retained in git history; replaced below.
   private visitTile(tile: TerrainTileKey, ancestorMeetsSse: boolean, details: TraversalDetails, ctx: TraversalContext): void {
     const key = this.tileKey(tile);
     const state = this.ensureState(tile);
@@ -482,6 +455,193 @@ export class GlobeQuadtree {
     details.notYetRenderableCount = cachedAccessor.fullyRenderable ? 0 : 1;
   }
 
+  */
+
+  /** 3d-tiles-renderer markUsedTiles：按视锥与 SSE 构建本帧 used 子树。 */
+  private markUsedTiles(tile: TerrainTileKey, ctx: TraversalContext): void {
+    const state = this.resetFrameState(tile, ctx);
+    if (!state.inFrustum) {
+      if (this.containsNeededPosition(tile) && this.accessorOf(tile, ctx).needsLoading) {
+        ctx.culledButNeededKeys.add(state.key);
+        this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
+      }
+      return;
+    }
+
+    if (!this.canTraverse(tile, state, ctx)) {
+      state.used = true;
+      return;
+    }
+
+    const children = this.childrenOf(tile);
+    let anyChildrenUsed = false;
+    let anyChildrenInFrustum = false;
+    for (const child of children) {
+      this.markUsedTiles(child, ctx);
+      const childState = this.ensureState(child);
+      anyChildrenUsed ||= childState.lastFrameVisited === ctx.frameNumber && childState.used;
+      anyChildrenInFrustum ||= childState.lastFrameVisited === ctx.frameNumber && childState.inFrustum;
+    }
+
+    if (!anyChildrenInFrustum) {
+      state.inFrustum = false;
+      for (const child of children) ctx.touchedKeys.add(this.tileKey(child));
+      return;
+    }
+
+    state.used = true;
+    state.refined = anyChildrenUsed;
+    if (state.refined) this.debugCounts.refined += 1;
+    if (anyChildrenUsed && (this.preloadAncestors || this.preloadSiblings)) {
+      // Match 3d-tiles-renderer exactly: loadAncestors implicitly enables the four siblings.
+      // This prevents a newly visible sibling from forcing its whole parent active for 1-2
+      // frames during lateral camera movement. Tile-local synthetic bounds keep this bounded.
+      for (const child of children) this.recursivelyMarkUsed(child, ctx);
+    }
+  }
+
+  /** Mark a sibling fallback tile as used without forcing deeper refinement. */
+  private recursivelyMarkUsed(tile: TerrainTileKey, ctx: TraversalContext): void {
+    this.resetFrameState(tile, ctx).used = true;
+  }
+
+  /** 3d-tiles-renderer markUsedSetLeaves：自底向上计算叶节点和子内容就绪状态。 */
+  private markUsedSetLeaves(tile: TerrainTileKey, ctx: TraversalContext): void {
+    const state = this.ensureState(tile);
+    if (state.lastFrameVisited !== ctx.frameNumber || !state.used) return;
+
+    const usedChildren = this.childrenOf(tile).filter(child => {
+      const childState = this.ensureState(child);
+      return childState.lastFrameVisited === ctx.frameNumber && childState.used;
+    });
+    if (usedChildren.length === 0) {
+      state.isLeaf = true;
+      return;
+    }
+
+    let allChildrenLoaded = true;
+    for (const child of usedChildren) {
+      this.markUsedSetLeaves(child, ctx);
+      const childState = this.ensureState(child);
+      // loadAncestors marks all four siblings as used for prefetching. Unlike a 3D Tiles content
+      // tree, globe siblings can cover a large off-screen or polar region whose imagery may never
+      // become renderable. Keep preloading it, but do not let it gate replacement of the visible
+      // part of this parent.
+      if (!childState.inFrustum) continue;
+      allChildrenLoaded &&= this.accessorOf(child, ctx).fullyRenderable || childState.allChildrenLoaded;
+    }
+    state.allChildrenLoaded = allChildrenLoaded;
+  }
+
+  /** 3d-tiles-renderer markVisibleTiles：REPLACE 父级保持 active，直到全部 used 子级可显示。 */
+  private markVisibleTiles(tile: TerrainTileKey, ctx: TraversalContext): void {
+    const state = this.ensureState(tile);
+    if (state.lastFrameVisited !== ctx.frameNumber || !state.used) return;
+
+    // loadAncestors may hold a parent while its first child frontier is loading. Once this
+    // branch was already refined last frame, never demote it merely because a newly visible
+    // sibling is still loading; keep the ready descendants active. A genuine zoom-out still
+    // stops in markUsedTiles and reaches the normal isLeaf path above.
+    if (this.preloadAncestors && state.refined && !state.allChildrenLoaded && !state.wasRefined) {
+      state.isLeaf = true;
+    }
+    if (state.isLeaf) {
+      state.active = true;
+      return;
+    }
+
+    let allChildrenReady = true;
+    for (const child of this.childrenOf(tile)) {
+      const childState = this.ensureState(child);
+      if (childState.lastFrameVisited !== ctx.frameNumber || !childState.used) continue;
+      this.markVisibleTiles(child, ctx);
+      if (!childState.inFrustum) continue;
+      const childReady = childState.active && this.accessorOf(child, ctx).fullyRenderable;
+      if (!childReady && !childState.allChildrenReady) allChildrenReady = false;
+    }
+    state.allChildrenReady = allChildrenReady;
+
+    if (!allChildrenReady && state.wasActive && this.accessorOf(tile, ctx).fullyRenderable) {
+      state.active = true;
+      this.kickActiveChildren(tile, ctx);
+    }
+  }
+
+  /** Keep descendants loaded while removing them from the REPLACE display frontier. */
+  private kickActiveChildren(tile: TerrainTileKey, ctx: TraversalContext): void {
+    for (const child of this.childrenOf(tile)) {
+      const state = this.ensureState(child);
+      if (state.lastFrameVisited !== ctx.frameNumber || !state.used) continue;
+      if (state.active) {
+        state.active = false;
+        state.kicked = true;
+      }
+      this.kickActiveChildren(child, ctx);
+    }
+  }
+
+  /** 3d-tiles-renderer toggleTiles 的无渲染器适配：生成 renderList 与加载优先级。 */
+  private collectTiles(tile: TerrainTileKey, ctx: TraversalContext): void {
+    const state = this.ensureState(tile);
+    if (state.lastFrameVisited !== ctx.frameNumber || !state.used) return;
+
+    ctx.touchedKeys.add(state.key);
+    const accessor = this.accessorOf(tile, ctx);
+    const activeInFrustum = state.active && state.inFrustum;
+    state.visible = activeInFrustum && accessor.fullyRenderable;
+    // Keep unloaded active leaves in the selected frontier. Globe.applySelection resolves
+    // them to the nearest renderable ancestor, so a pending mesh/material cannot expose the
+    // clear color as a rectangular hole.
+    if (activeInFrustum) this.addTileToRenderList(ctx, tile);
+
+    if (accessor.needsLoading) {
+      if (state.active || state.kicked) this.queueTileLoad(ctx, ctx.loadQueueHigh, tile, state);
+      else if (state.inFrustum) this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
+      else this.queueTileLoad(ctx, ctx.loadQueueLow, tile, state);
+    }
+    for (const child of this.childrenOf(tile)) this.collectTiles(child, ctx);
+  }
+
+  /** Reset persistent traversal state exactly once per frame and calculate view error. */
+  private resetFrameState(tile: TerrainTileKey, ctx: TraversalContext): TraversalTileState {
+    const state = this.ensureState(tile);
+    if (state.lastFrameVisited === ctx.frameNumber) return state;
+    state.wasActive = state.active;
+    state.wasVisible = state.visible;
+    state.usedLastFrame = state.used;
+    state.wasRefined = state.refined;
+    state.lastFrameVisited = ctx.frameNumber;
+    state.used = false;
+    state.active = false;
+    state.visible = false;
+    state.inFrustum = this.computeTileVisibility(tile, ctx) !== Visibility.NONE;
+    state.isLeaf = false;
+    state.refined = false;
+    state.allChildrenReady = false;
+    state.allChildrenLoaded = false;
+    state.kicked = false;
+    state.error = this.screenSpaceError(tile, state);
+    ctx.touchedKeys.add(state.key);
+    this.debugCounts.visited += 1;
+    return state;
+  }
+
+  private canTraverse(tile: TerrainTileKey, state: TraversalTileState, ctx: TraversalContext): boolean {
+    return state.error > this.maximumScreenSpaceError && this.canRefine(tile, ctx);
+  }
+
+  private childrenOf(tile: TerrainTileKey): TerrainTileKey[] {
+    const level = tile.level + 1;
+    const x = tile.x * 2;
+    const y = tile.y * 2;
+    return [
+      { x, y, level },
+      { x: x + 1, y, level },
+      { x, y: y + 1, level },
+      { x: x + 1, y: y + 1, level },
+    ];
+  }
+
   /** 取得或计算瓦片矩形（缓存于瓦片状态，避免每帧多次分配 Cesium Rectangle）。 */
   private rectangleOf(tile: TerrainTileKey): Rectangle {
     const state = this.ensureState(tile);
@@ -508,13 +668,20 @@ export class GlobeQuadtree {
       needsLoading: ctx.accessor.needsLoading(tile),
       hasTerrainData: ctx.accessor.hasTerrainData(tile),
       upsampled: ctx.accessor.isUpsampledFromParent(tile),
-      volume: ctx.accessor.getBoundingVolume(tile),
+      // GeneratedSurfacePlugin assigns every virtual child its own region. Do the same here
+      // instead of inheriting a large ancestor sphere, which causes grazing-angle fan-out.
+      volume: ctx.accessor.getBoundingVolume(tile) ?? BoundingSphere.fromRectangle3D(
+        this.rectangleOf(tile),
+        this.tilingScheme.ellipsoid,
+        this.terrainProvider.getLevelMaximumGeometricError(tile.level),
+      ),
     };
     this.accessorCache.set(key, entry);
     return entry;
   }
 
   /** 对齐 Cesium visitVisibleChildrenNearToFar：按相机所在象限 near-to-far 访问四个子瓦片。 */
+  /* Legacy Cesium child visitation replaced by markUsedTiles.
   private visitVisibleChildrenNearToFar(
     children: TerrainTileKey[],
     ctx: TraversalContext,
@@ -548,7 +715,9 @@ export class GlobeQuadtree {
     details.notYetRenderableCount = combined.notYetRenderableCount;
   }
 
+  */
   /** 对齐 Cesium visitIfVisible。 */
+  /* Legacy Cesium child visitation replaced by markUsedTiles.
   private visitIfVisible(tile: TerrainTileKey, ctx: TraversalContext, ancestorMeetsSse: boolean, details: TraversalDetails): void {
     if (this.computeTileVisibility(tile, ctx) !== Visibility.NONE) {
       this.visitTile(tile, ancestorMeetsSse, details, ctx);
@@ -578,6 +747,8 @@ export class GlobeQuadtree {
     }
     state.resultFrame = ctx.frameNumber;
   }
+
+  */
 
   /**
    * 对齐 Cesium GlobeSurfaceTileProvider.computeTileVisibility：
@@ -653,9 +824,10 @@ export class GlobeQuadtree {
 
   /** 对齐 Cesium QuadtreePrimitive.queueTileLoad：只入队需要加载的瓦片并计算优先级。 */
   private queueTileLoad(ctx: TraversalContext, queue: TerrainTileKey[], tile: TerrainTileKey, state: TraversalTileState): void {
-    if (!this.accessorOf(tile, ctx).needsLoading) {
+    if (!this.accessorOf(tile, ctx).needsLoading || ctx.queuedLoads.has(state.key)) {
       return;
     }
+    ctx.queuedLoads.add(state.key);
     state.priority = this.computeTileLoadPriority(tile, state, ctx);
     queue.push(tile);
   }
@@ -722,6 +894,7 @@ export class GlobeQuadtree {
     );
   }
 
+  /* Legacy Cesium TraversalDetails pool.
   private readonly detailsPool: TraversalDetails[] = [];
 
   private acquireDetails(count: number): TraversalDetails[] {
@@ -740,6 +913,8 @@ export class GlobeQuadtree {
       this.detailsPool.push(item);
     }
   }
+
+  */
 
   /** level zero 瓦片列表。 */
   private levelZeroTiles(): TerrainTileKey[] {
@@ -880,7 +1055,27 @@ export class GlobeQuadtree {
     const key = this.tileKey(tile);
     let state = this.states.get(key);
     if (!state) {
-      state = { key, result: SelectionResult.NONE, resultFrame: -1, distance: 9_999_999_999.0, priority: 0, rectangle: null };
+      state = {
+        key,
+        lastFrameVisited: -1,
+        used: false,
+        usedLastFrame: false,
+        active: false,
+        wasActive: false,
+        visible: false,
+        wasVisible: false,
+        inFrustum: false,
+        isLeaf: false,
+        refined: false,
+        wasRefined: false,
+        allChildrenReady: false,
+        allChildrenLoaded: false,
+        kicked: false,
+        distance: 9_999_999_999.0,
+        error: Infinity,
+        priority: 0,
+        rectangle: null,
+      };
       this.states.set(key, state);
     }
     return state;

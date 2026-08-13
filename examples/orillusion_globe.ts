@@ -6,7 +6,7 @@ import { configureGlobeRendering, Globe, GlobeComponent, GlobeControls, ThreeCon
 async function bootstrap(): Promise<void> {
   const mapToken = '39d358c825ec7e59142958656c0a6864';
   // 必须早于 Engine3D.init：避免 Orillusion 按默认五十万矩阵创建 48 MB 的全局矩阵缓冲。
-  configureGlobeRendering({ matrixCapacity: 16_384 });
+  configureGlobeRendering({ matrixCapacity: 4_096 });
   // ECEF 大尺度渲染必需的三件套：
   //  - useLogDepth：near=1/far=1e8 线性深度在远距离挤爆，且拾取反投影数值病态；
   //  - useRTE + doublePrecision：模型矩阵按 f64 维护、着色器做分裂双精度

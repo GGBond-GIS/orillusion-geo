@@ -121,9 +121,17 @@ export class Globe {
     needsLoading: (tile) => {
       const key = this.tileKey(tile);
       const surfaceTile = this.surfaceTiles.get(key);
-      if (!surfaceTile) return false;
+      // Traversal creates virtual quadtree children before Globe materializes their
+      // CesiumSurfaceTile state. They must be considered loadable in this frame; update()
+      // creates every touched SurfaceTile before consuming the returned load queues.
+      if (!surfaceTile) return true;
       if (surfaceTile.state !== TerrainTileState.Ready) return true;
       const imagery = this.surfaceImagery.get(key);
+      // Download completion is not the end of this adapter's load pipeline. A child can be
+      // kicked from the render frontier after its image finishes but before its material commit
+      // runs. If that state is reported as fully loaded it disappears from every queue forever,
+      // while the parent keeps waiting for isFullyRenderable and remains visibly coarse.
+      if (!this.imageryMaterialRevision.has(key)) return true;
       return imagery ? !imagery.isDoneLoading : false;
     },
     hasTerrainData: (tile) => {
@@ -138,14 +146,10 @@ export class Globe {
       return imagery ? imagery.allTileImageryFailedOrInvalid : true;
     },
     getBoundingVolume: (tile) => {
-      // 对齐 Cesium updateTileBoundingRegion：本瓦片无包围体时沿祖先链取最近的地形包围体。
-      let current: string | null = this.tileKey(tile);
-      while (current) {
-        const volume = this.surfaceTiles.get(current)?.boundingVolume;
-        if (volume) return volume;
-        current = this.quadtree.parentKey(current);
-      }
-      return undefined;
+      // Only return this tile's measured terrain bounds. GlobeQuadtree creates a tile-local
+      // synthetic region for virtual/unloaded children; inheriting an ancestor sphere makes
+      // every descendant appear visible at grazing angles.
+      return this.surfaceTiles.get(this.tileKey(tile))?.boundingVolume ?? undefined;
     },
   };
 
@@ -310,11 +314,12 @@ export class Globe {
   private processTileLoadQueue(traversal: GlobeTraversalResult): void {
     this.lastTraversal = traversal;
     const { loadQueueHigh, loadQueueMedium, loadQueueLow } = traversal;
+    // 3d-tiles-renderer enforces its LRU budget every update. The previous Cesium-style early
+    // return retained the deepest zoom's resources forever after the load queues settled.
+    this.trimTileCache();
     if (loadQueueHigh.length === 0 && loadQueueMedium.length === 0 && loadQueueLow.length === 0) {
       return;
     }
-    // 对齐 Cesium：仅当本帧存在加载队列时才 trim 瓦片缓存。
-    this.trimTileCache();
     const endTime = performance.now() + this.loadQueueTimeSlice;
     let didSomeLoading = this.processSingleLoadQueue(loadQueueHigh, endTime, false);
     didSomeLoading = this.processSingleLoadQueue(loadQueueMedium, endTime, didSomeLoading);
@@ -349,8 +354,12 @@ export class Globe {
    */
   private processImageryStateMachines(traversal: GlobeTraversalResult): void {
     const keys = new Set<string>();
-    for (const coordinate of traversal.renderList) keys.add(this.tileKey(coordinate));
+    // The quadtree has already sorted the high queue by screen-centre angle and distance. Feed
+    // imagery in that order before the DFS render list; otherwise the first 18 DFS tiles can
+    // repeatedly occupy every request slot and starve a central visible tile until the camera
+    // moves enough to change traversal order.
     for (const coordinate of traversal.loadQueueHigh) keys.add(this.tileKey(coordinate));
+    for (const coordinate of traversal.renderList) keys.add(this.tileKey(coordinate));
     for (const coordinate of traversal.loadQueueMedium) keys.add(this.tileKey(coordinate));
     for (const coordinate of traversal.loadQueueLow) keys.add(this.tileKey(coordinate));
     for (const key of traversal.culledButNeededKeys) keys.delete(key);
@@ -535,30 +544,68 @@ export class Globe {
   /** 对齐 Cesium addTileToRenderList 后的绘制阶段：可渲染瓦片直接绘制，否则回退最近的可渲染祖先
    *  （Cesium 在此时绘制 fill，项目没有 fill 几何，用祖先替代，细节不消失）。 */
   private applySelection(renderList: TerrainTileKey[]): void {
-    const drawKeys = new Set<string>();
+    const candidates = new Set<string>();
     for (const coordinate of renderList) {
       const key = this.tileKey(coordinate);
       if (this.isRenderable(key)) {
-        drawKeys.add(key);
+        candidates.add(key);
         continue;
       }
       let ancestor = this.quadtree.parentKey(key);
       while (ancestor) {
         if (this.isRenderable(ancestor)) {
-          drawKeys.add(ancestor);
+          candidates.add(ancestor);
           break;
         }
         ancestor = this.quadtree.parentKey(ancestor);
       }
     }
-    for (const [key, object] of this.tiles) {
-      const renderer = object.getComponent(MeshRenderer);
-      renderer.enable = drawKeys.has(key);
-      // 拾取一致性：ColliderComponent 参与引擎 enablePickerList 遍历（bound 拾取），
-      // 必须与渲染可见性同步，避免屏幕外的隐藏瓦片被拾取到。
-      const collider = object.getComponent(ColliderComponent);
-      if (collider) collider.enable = renderer.enable;
+
+    // Cesium renders an unready selected tile with a TerrainFillMesh that has exactly the
+    // selected tile's footprint. We do not have fill geometry yet, so the fallback above uses
+    // a complete ancestor tile. If one sibling falls back while another sibling is ready, the
+    // ancestor and the ready sibling would otherwise be drawn over the same surface for a frame.
+    // Collapse the candidates to a quadtree antichain: an ancestor fallback atomically replaces
+    // every candidate below it until all selected descendants are renderable.
+    const drawKeys = new Set<string>();
+    const shallowestFirst = [...candidates].sort((left, right) =>
+      this.parseTileKey(left).level - this.parseTileKey(right).level,
+    );
+    for (const key of shallowestFirst) {
+      let ancestor = this.quadtree.parentKey(key);
+      let coveredByAncestor = false;
+      while (ancestor) {
+        if (drawKeys.has(ancestor)) {
+          coveredByAncestor = true;
+          break;
+        }
+        ancestor = this.quadtree.parentKey(ancestor);
+      }
+      if (!coveredByAncestor) drawKeys.add(key);
     }
+
+    // Commit the replacement in two phases. Tiles are inserted parent-first, so a single pass
+    // would enable a parent before disabling its old descendants during a down-level switch.
+    // Orillusion updates its render-component registry from the enable setter; removing every
+    // outgoing tile first prevents an intermediate parent+descendant state from leaking into a
+    // render-node snapshot or a picking pass.
+    for (const [key, object] of this.tiles) {
+      if (!drawKeys.has(key)) this.setTileVisibility(object, false);
+    }
+    for (const key of drawKeys) {
+      const object = this.tiles.get(key);
+      if (object) this.setTileVisibility(object, true);
+    }
+  }
+
+  /** Atomically keep the terrain renderer and its picker participation in the same state. */
+  private setTileVisibility(object: Object3D, visible: boolean): void {
+    const renderer = object.getComponent(MeshRenderer);
+    if (renderer.enable !== visible) renderer.enable = visible;
+    // 拾取一致性：ColliderComponent 参与引擎 enablePickerList 遍历（bound 拾取），
+    // 必须与渲染可见性同步，避免屏幕外的隐藏瓦片被拾取到。
+    const collider = object.getComponent(ColliderComponent);
+    if (collider && collider.enable !== visible) collider.enable = visible;
   }
 
   /** 地形实体和最终影像材质都提交后才允许显示。 */
@@ -617,6 +664,9 @@ export class Globe {
         this.quadtree.invalidate(key);
         const object = this.tiles.get(key);
         this.tiles.delete(key);
+        // The replacement queue owns the lifetime of the surface tile as well. Keeping it in
+        // this map retained TerrainData, parent links and traversal state after GPU eviction.
+        this.surfaceTiles.delete(key);
         const imagery = this.surfaceImagery.get(key);
         this.surfaceImagery.delete(key);
         this.imageryMaterialRevision.delete(key);

@@ -61,7 +61,7 @@ interface PickData {
 async function bootstrap(): Promise<void> {
   const mapToken = '39d358c825ec7e59142958656c0a6864';
   // 必须早于 Engine3D.init：避免 Orillusion 按默认五十万矩阵创建 48 MB 的全局矩阵缓冲。
-  configureGlobeRendering({ matrixCapacity: 16_384 });
+  configureGlobeRendering({ matrixCapacity: 4_096 });
   const engine = await Engine3D.init({
     setting: {
         useRTE: true,            // 开启相对相机渲染

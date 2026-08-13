@@ -60,6 +60,12 @@ interface ManagedImagery {
   textureQueued: boolean;
   reprojectionQueued: boolean;
   disposed: boolean;
+  /** Number of consecutive network failures. Reset after a successful response. */
+  retryCount: number;
+  /** Earliest time at which another request may be issued. */
+  retryAfter: number;
+  /** Invalidates callbacks belonging to an older timed-out request. */
+  requestGeneration: number;
 }
 
 /** 待批处理的重投影任务。 */
@@ -98,6 +104,10 @@ export class CesiumImageryRuntime {
    * 超过时保持 Unloaded，下一帧重试（对齐 Cesium 被节流时返回 undefined 的语义）。
    */
   public maximumConcurrentRequests = 18;
+  /** A provider promise must not keep one LOD branch in TRANSITIONING forever. */
+  public imageryRequestTimeout = 12_000;
+  /** Exponential retry delay is capped so a transiently failed tile eventually upgrades. */
+  public maximumImageryRetryDelay = 10_000;
   /**
    * 每帧最多重投影的影像数量。地理投影影像（非 WebMercator）时每个任务都是一次
    * 全屏 compute dispatch（源纹理采样 + 目标写入，显存带宽密集）；默认 32 会让
@@ -436,7 +446,7 @@ export class CesiumSurfaceImagery {
    */
   private processImagery(managed: ManagedImagery, needGeographicProjection: boolean, skipLoading: boolean): void {
     if (managed.disposed) return;
-    if (managed.state === ImageryState.Unloaded && !skipLoading) {
+    if (managed.state === ImageryState.Unloaded && !skipLoading && performance.now() >= managed.retryAfter) {
       this.requestImagery(managed);
       return;
     }
@@ -459,17 +469,105 @@ export class CesiumSurfaceImagery {
     const { imageryLayer, x, y, level } = managed.source;
     const request = imageryLayer.imageryProvider.requestImage(x, y, level);
     if (!request) return;
+    const generation = ++managed.requestGeneration;
     managed.state = ImageryState.Transitioning;
     this.options.runtime.activeRequests += 1;
-    managed.request = Promise.resolve(request)
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const sourceRequest = Promise.resolve(request);
+    const timeoutRequest = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        timedOut = true;
+        reject(new Error(`Imagery request timed out: ${level}/${x}/${y}`));
+      }, this.options.runtime.imageryRequestTimeout);
+    });
+    // A late ImageBitmap is no longer consumed by Promise.race; close it explicitly instead of
+    // leaving native image memory alive until GC.
+    void sourceRequest.then(image => {
+      if (timedOut && typeof (image as any)?.close === 'function') (image as any).close();
+    }).catch(() => undefined);
+    managed.request = Promise.race([sourceRequest, timeoutRequest])
       .then(image => {
-        if (managed.disposed) { if (typeof (image as any)?.close === 'function') (image as any).close(); return; }
+        if (managed.disposed || managed.requestGeneration !== generation) {
+          if (typeof (image as any)?.close === 'function') (image as any).close();
+          return;
+        }
         if (!image) { managed.state = ImageryState.Invalid; return; }
+        // Some WMTS services (notably Tianditu) answer quota/auth failures with HTTP 200 and a
+        // beige, watermarked JPEG. Cesium's provider therefore resolves requestImage normally.
+        // Reject flat light-colour placeholder tiles here so the normal ancestor fallback and
+        // retry path are used instead of uploading the error image as valid imagery.
+        if (this.isLikelyProviderErrorImage(image)) {
+          if (typeof (image as any)?.close === 'function') (image as any).close();
+          throw new Error(`Imagery provider returned a placeholder tile: ${level}/${x}/${y}`);
+        }
         managed.image = image;
+        managed.retryCount = 0;
+        managed.retryAfter = 0;
         managed.state = ImageryState.Received;
       })
-      .catch(() => { if (!managed.disposed) managed.state = ImageryState.Failed; })
-      .finally(() => { this.options.runtime.activeRequests -= 1; });
+      .catch(() => {
+        if (managed.disposed || managed.requestGeneration !== generation) return;
+        // A transient provider/network failure must not permanently freeze this region on its
+        // ancestor texture. Keep the ancestor visible and retry with bounded exponential backoff.
+        managed.retryCount += 1;
+        managed.retryAfter = performance.now() + Math.min(
+          this.options.runtime.maximumImageryRetryDelay,
+          250 * (2 ** Math.min(managed.retryCount - 1, 6)),
+        );
+        managed.state = ImageryState.Unloaded;
+      })
+      .finally(() => {
+        if (timeout) clearTimeout(timeout);
+        if (managed.requestGeneration === generation) managed.request = undefined;
+        this.options.runtime.activeRequests -= 1;
+      });
+  }
+
+  /**
+   * Detect the flat, light-colour error JPEG returned as a successful WMTS response.
+   * The test deliberately requires one quantized colour to cover most samples, which avoids
+   * rejecting ordinary bright satellite content such as clouds or snow.
+   */
+  private isLikelyProviderErrorImage(image: any): boolean {
+    const sourceWidth = Number(image?.naturalWidth ?? image?.videoWidth ?? image?.width ?? 0);
+    const sourceHeight = Number(image?.naturalHeight ?? image?.videoHeight ?? image?.height ?? 0);
+    if (sourceWidth < 16 || sourceHeight < 16) return false;
+    try {
+      const size = 32;
+      const canvas = typeof OffscreenCanvas !== 'undefined'
+        ? new OffscreenCanvas(size, size)
+        : Object.assign(document.createElement('canvas'), { width: size, height: size });
+      const context = canvas.getContext('2d', { willReadFrequently: true }) as
+        | CanvasRenderingContext2D
+        | OffscreenCanvasRenderingContext2D
+        | null;
+      if (!context) return false;
+      context.drawImage(image, 0, 0, size, size);
+      const pixels = context.getImageData(0, 0, size, size).data;
+      const histogram = new Map<number, number>();
+      let dominantKey = 0;
+      let dominantCount = 0;
+      for (let index = 0; index < pixels.length; index += 4) {
+        if (pixels[index + 3] < 240) continue;
+        const key = ((pixels[index] >> 3) << 10) | ((pixels[index + 1] >> 3) << 5) | (pixels[index + 2] >> 3);
+        const count = (histogram.get(key) ?? 0) + 1;
+        histogram.set(key, count);
+        if (count > dominantCount) {
+          dominantCount = count;
+          dominantKey = key;
+        }
+      }
+      if (dominantCount / (size * size) < 0.68) return false;
+      const red = ((dominantKey >> 10) & 31) << 3;
+      const green = ((dominantKey >> 5) & 31) << 3;
+      const blue = (dominantKey & 31) << 3;
+      return Math.min(red, green, blue) >= 168 && Math.max(red, green, blue) - Math.min(red, green, blue) <= 48;
+    } catch {
+      // A tainted HTMLImageElement cannot be inspected. Keep the provider's normal behaviour in
+      // that case; Cesium providers fetched through Resource usually expose an ImageBitmap.
+      return false;
+    }
   }
 
   /**
@@ -519,7 +617,16 @@ export class CesiumSurfaceImagery {
   private getManaged(source: CesiumImageryLike): ManagedImagery {
     let managed = this.options.runtime.managed.get(source);
     if (!managed) {
-      managed = { source, state: ImageryState.Unloaded, textureQueued: false, reprojectionQueued: false, disposed: false };
+      managed = {
+        source,
+        state: ImageryState.Unloaded,
+        textureQueued: false,
+        reprojectionQueued: false,
+        disposed: false,
+        retryCount: 0,
+        retryAfter: 0,
+        requestGeneration: 0,
+      };
       this.options.runtime.managed.set(source, managed);
     }
     return managed;
