@@ -154,7 +154,7 @@ export class Globe {
     getHeightRange: (tile) => {
       const mesh = this.surfaceTiles.get(this.tileKey(tile))?.mesh;
       if (mesh && Number.isFinite(mesh.minimumHeight) && Number.isFinite(mesh.maximumHeight)) {
-        return { minimumHeight: mesh.minimumHeight, maximumHeight: mesh.maximumHeight };
+        return mesh;
       }
       return undefined;
     },

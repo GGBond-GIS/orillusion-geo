@@ -28,9 +28,9 @@ export interface TerrainHeightRange {
 export interface GlobeTileAccessor {
   /** 对齐 Cesium tile.renderable：地形网格与影像都就绪，本帧可真实绘制。 */
   isFullyRenderable(tile: TerrainTileKey): boolean;
-  /** 对齐 Cesium tile.state === DONE：地形与影像全部完成加载。 */
+  /** Legacy Cesium selector hook retained for accessor compatibility. */
   isCompletelyLoaded(tile: TerrainTileKey): boolean;
-  /** 对齐 Cesium canRenderWithoutLosingDetail：渲染该瓦片不会丢失上一帧可见的细节。 */
+  /** Legacy Cesium selector hook retained for accessor compatibility. */
   canRenderWithoutLosingDetail(tile: TerrainTileKey): boolean;
   /** 对齐 Cesium tile.needsLoading：该瓦片还需要加载。 */
   needsLoading(tile: TerrainTileKey): boolean;
@@ -126,8 +126,6 @@ interface TraversalTileState {
 interface AccessorCacheEntry {
   frame: number;
   fullyRenderable: boolean;
-  completelyLoaded: boolean;
-  canRender: boolean;
   needsLoading: boolean;
   hasTerrainData: boolean;
   upsampled: boolean;
@@ -677,26 +675,28 @@ export class GlobeQuadtree {
       ? this.accessorOf({ x: Math.floor(tile.x / 2), y: Math.floor(tile.y / 2), level: tile.level - 1 }, ctx).heightRange
       : undefined);
     const state = this.ensureState(tile);
-    const entry: AccessorCacheEntry = {
-      frame: ctx.frameNumber,
-      fullyRenderable: ctx.accessor.isFullyRenderable(tile),
-      completelyLoaded: ctx.accessor.isCompletelyLoaded(tile),
-      canRender: ctx.accessor.canRenderWithoutLosingDetail(tile),
-      needsLoading: ctx.accessor.needsLoading(tile),
-      hasTerrainData: ctx.accessor.hasTerrainData(tile),
-      upsampled: ctx.accessor.isUpsampledFromParent(tile),
-      heightRange: inheritedHeightRange,
-      // Keep a tile-local volume for virtual children, but span the nearest decoded ancestor's
-      // complete height interval. A sphere placed at one synthetic height can sit entirely
-      // outside the near/side frustum planes while the child's real mountain terrain is visible,
-      // permanently preventing that nearby branch from being traversed and requested.
-      volume: ctx.accessor.getBoundingVolume(tile) ?? this.createConservativeBoundingVolume(
-        tile,
-        inheritedHeightRange,
-        state,
-      ),
+    const volume = ctx.accessor.getBoundingVolume(tile) ?? this.createConservativeBoundingVolume(
+      tile,
+      inheritedHeightRange,
+      state,
+    );
+    const entry = cached ?? {
+      frame: -1,
+      fullyRenderable: false,
+      needsLoading: true,
+      hasTerrainData: false,
+      upsampled: false,
+      heightRange: undefined,
+      volume: undefined,
     };
-    this.accessorCache.set(key, entry);
+    entry.frame = ctx.frameNumber;
+    entry.fullyRenderable = ctx.accessor.isFullyRenderable(tile);
+    entry.needsLoading = ctx.accessor.needsLoading(tile);
+    entry.hasTerrainData = ctx.accessor.hasTerrainData(tile);
+    entry.upsampled = ctx.accessor.isUpsampledFromParent(tile);
+    entry.heightRange = inheritedHeightRange;
+    entry.volume = volume;
+    if (!cached) this.accessorCache.set(key, entry);
     return entry;
   }
 

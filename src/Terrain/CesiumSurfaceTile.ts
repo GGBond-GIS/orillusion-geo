@@ -1,4 +1,4 @@
-import { BoundingSphere, Cartesian2, Cartesian3, type TerrainData, type TerrainProvider } from '@cesium/engine';
+import { BoundingSphere, Cartesian2, Cartesian3, Request, RequestType, type TerrainData, type TerrainProvider } from '@cesium/engine';
 import { TerrainTileState, type TerrainTileKey } from './TerrainTileState.js';
 
 /** Cesium TerrainMesh 的运行时结构；该类型并未由 @cesium/engine 公开导出。 */
@@ -143,7 +143,16 @@ export class CesiumSurfaceTile {
    */
   private requestTerrain(provider: TerrainProvider): void {
     const { x, y, level } = this.key;
-    const request = provider.requestTileGeometry(x, y, level);
+    // Match Cesium GlobeSurfaceTile: terrain requests are not globally throttled, but they are
+    // throttled per server. Without a Request object Resource.fetchArrayBuffer bypasses the
+    // scheduler entirely; a grazing traversal can then synchronously create hundreds of XHRs
+    // on the main thread in a few frames.
+    const schedulerRequest = new Request({
+      throttle: false,
+      throttleByServer: true,
+      type: RequestType.TERRAIN,
+    });
+    const request = provider.requestTileGeometry(x, y, level, schedulerRequest);
     if (!request) return;
     this.state = TerrainTileState.Receiving;
     this.pending = request.then(data => {
