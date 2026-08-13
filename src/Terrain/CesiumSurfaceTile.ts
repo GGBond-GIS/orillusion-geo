@@ -9,6 +9,10 @@ export interface CesiumTerrainMesh {
   vertices: Float32Array;
   /** 三角形索引。 */
   indices: Uint8Array | Uint16Array | Uint32Array;
+  /** Lowest source height represented by this tile, in metres above the ellipsoid. */
+  minimumHeight: number;
+  /** Highest source height represented by this tile, in metres above the ellipsoid. */
+  maximumHeight: number;
   /** 每个顶点的元素数量。 */
   stride: number;
   /** Cesium TerrainEncoding 解码器。 */

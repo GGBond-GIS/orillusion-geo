@@ -1,4 +1,4 @@
-import { BoundingSphere, Cartesian3, Cartographic, type Rectangle, type TerrainProvider, type TilingScheme } from '@cesium/engine';
+import { BoundingSphere, Cartesian3, Cartographic, Rectangle, type TerrainProvider, type TilingScheme } from '@cesium/engine';
 // @ts-expect-error Cesium 将 Globe 使用的 EllipsoidalOccluder 保留在 Source 内部，运行时代码随 engine 包发布。
 import EllipsoidalOccluder from '@cesium/engine/Source/Core/EllipsoidalOccluder.js';
 import type { Camera3D } from '@orillusion/core';
@@ -18,6 +18,12 @@ interface FrustumPlane {
   w: number;
 }
 
+/** Known terrain-height interval inherited from the nearest ready ancestor. */
+export interface TerrainHeightRange {
+  minimumHeight: number;
+  maximumHeight: number;
+}
+
 /** Globe 提供的瓦片状态访问器，对应 Cesium QuadtreeTile / GlobeSurfaceTile 的只读面。 */
 export interface GlobeTileAccessor {
   /** 对齐 Cesium tile.renderable：地形网格与影像都就绪，本帧可真实绘制。 */
@@ -34,6 +40,8 @@ export interface GlobeTileAccessor {
   isUpsampledFromParent(tile: TerrainTileKey): boolean;
   /** 对齐 Cesium tileBoundingRegion.boundingVolume：真实地形包围体，未就绪回退父级，再无则 undefined。 */
   getBoundingVolume(tile: TerrainTileKey): BoundingSphere | undefined;
+  /** Height interval from this tile when it already has a decoded terrain mesh. */
+  getHeightRange(tile: TerrainTileKey): TerrainHeightRange | undefined;
 }
 
 /** GlobeQuadtree 选择参数，对齐 Cesium QuadtreePrimitive / Globe / Scene.fog。 */
@@ -104,6 +112,9 @@ interface TraversalTileState {
   error: number;
   priority: number;
   rectangle: Rectangle | null;
+  syntheticVolume: BoundingSphere | null;
+  syntheticMinimumHeight: number;
+  syntheticMaximumHeight: number;
 }
 
 /**
@@ -121,6 +132,7 @@ interface AccessorCacheEntry {
   hasTerrainData: boolean;
   upsampled: boolean;
   volume: BoundingSphere | undefined;
+  heightRange: TerrainHeightRange | undefined;
 }
 
 /** 单帧遍历上下文。 */
@@ -660,6 +672,11 @@ export class GlobeQuadtree {
     if (cached && cached.frame === ctx.frameNumber) {
       return cached;
     }
+    const ownHeightRange = ctx.accessor.getHeightRange(tile);
+    const inheritedHeightRange = ownHeightRange ?? (tile.level > 0
+      ? this.accessorOf({ x: Math.floor(tile.x / 2), y: Math.floor(tile.y / 2), level: tile.level - 1 }, ctx).heightRange
+      : undefined);
+    const state = this.ensureState(tile);
     const entry: AccessorCacheEntry = {
       frame: ctx.frameNumber,
       fullyRenderable: ctx.accessor.isFullyRenderable(tile),
@@ -668,16 +685,49 @@ export class GlobeQuadtree {
       needsLoading: ctx.accessor.needsLoading(tile),
       hasTerrainData: ctx.accessor.hasTerrainData(tile),
       upsampled: ctx.accessor.isUpsampledFromParent(tile),
-      // GeneratedSurfacePlugin assigns every virtual child its own region. Do the same here
-      // instead of inheriting a large ancestor sphere, which causes grazing-angle fan-out.
-      volume: ctx.accessor.getBoundingVolume(tile) ?? BoundingSphere.fromRectangle3D(
-        this.rectangleOf(tile),
-        this.tilingScheme.ellipsoid,
-        this.terrainProvider.getLevelMaximumGeometricError(tile.level),
+      heightRange: inheritedHeightRange,
+      // Keep a tile-local volume for virtual children, but span the nearest decoded ancestor's
+      // complete height interval. A sphere placed at one synthetic height can sit entirely
+      // outside the near/side frustum planes while the child's real mountain terrain is visible,
+      // permanently preventing that nearby branch from being traversed and requested.
+      volume: ctx.accessor.getBoundingVolume(tile) ?? this.createConservativeBoundingVolume(
+        tile,
+        inheritedHeightRange,
+        state,
       ),
     };
     this.accessorCache.set(key, entry);
     return entry;
+  }
+
+  /** Build a local pre-load volume without inheriting the ancestor's much wider footprint. */
+  private createConservativeBoundingVolume(
+    tile: TerrainTileKey,
+    range: TerrainHeightRange | undefined,
+    state: TraversalTileState,
+  ): BoundingSphere {
+    const geometricError = this.terrainProvider.getLevelMaximumGeometricError(tile.level);
+    // TerrainMesh min/max describe the full ancestor tile, so every descendant is already
+    // enclosed by that interval. Expanding it again by each level's geometric error makes
+    // grazing-angle volumes unnecessarily large and causes traversal/load fan-out.
+    const minimumHeight = range?.minimumHeight ?? -geometricError;
+    const maximumHeight = range?.maximumHeight ?? geometricError;
+    if (
+      state.syntheticVolume &&
+      state.syntheticMinimumHeight === minimumHeight &&
+      state.syntheticMaximumHeight === maximumHeight
+    ) {
+      return state.syntheticVolume;
+    }
+    const rectangle = this.rectangleOf(tile);
+    const ellipsoid = this.tilingScheme.ellipsoid;
+    const positions = Rectangle.subsample(rectangle, ellipsoid, minimumHeight);
+    const upperPositions = Rectangle.subsample(rectangle, ellipsoid, maximumHeight);
+    for (const position of upperPositions) positions.push(position);
+    state.syntheticVolume = BoundingSphere.fromPoints(positions, state.syntheticVolume ?? undefined);
+    state.syntheticMinimumHeight = minimumHeight;
+    state.syntheticMaximumHeight = maximumHeight;
+    return state.syntheticVolume;
   }
 
   /** 对齐 Cesium visitVisibleChildrenNearToFar：按相机所在象限 near-to-far 访问四个子瓦片。 */
@@ -1075,6 +1125,9 @@ export class GlobeQuadtree {
         error: Infinity,
         priority: 0,
         rectangle: null,
+        syntheticVolume: null,
+        syntheticMinimumHeight: Number.NaN,
+        syntheticMaximumHeight: Number.NaN,
       };
       this.states.set(key, state);
     }

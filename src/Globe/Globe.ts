@@ -151,6 +151,13 @@ export class Globe {
       // every descendant appear visible at grazing angles.
       return this.surfaceTiles.get(this.tileKey(tile))?.boundingVolume ?? undefined;
     },
+    getHeightRange: (tile) => {
+      const mesh = this.surfaceTiles.get(this.tileKey(tile))?.mesh;
+      if (mesh && Number.isFinite(mesh.minimumHeight) && Number.isFinite(mesh.maximumHeight)) {
+        return { minimumHeight: mesh.minimumHeight, maximumHeight: mesh.maximumHeight };
+      }
+      return undefined;
+    },
   };
 
   /**
