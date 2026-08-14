@@ -46,6 +46,7 @@ export class OrillusionTilesRenderer extends TilesRendererBase {
   private readonly camera: Camera3D;
   private readonly tilesetTransform = new Matrix4();
   private readonly boundingVolumeTransform = new Matrix4();
+  private readonly contentTransform = new Matrix4();
   private readonly eventListeners = new Map<string, Set<(event: unknown) => void>>();
 
   /**
@@ -235,6 +236,16 @@ export class OrillusionTilesRenderer extends TilesRendererBase {
   }
 
   /**
+   * 设置每个瓦片内容在 tileset 局部坐标系中的变换。
+   *
+   * 该变换在 tile.transform 之前作用于 GLB/B3DM 内容，适用于内容坐标轴和
+   * tileset 包围体坐标轴不一致的非标准数据集。请在开始加载根 tileset 前调用。
+   */
+  public setContentTransform(transform: Matrix4): void {
+    this.contentTransform.copy(transform);
+  }
+
+  /**
    * 设置只用于 LOD 与视锥计算的包围体局部变换。
    * @param transform 将 tileset boundingVolume 坐标转换到已渲染模型坐标的局部变换。
    */
@@ -297,6 +308,7 @@ export class OrillusionTilesRenderer extends TilesRendererBase {
     } else {
       throw new Error(`OrillusionTilesRenderer 不支持 “${type}” 类型的瓦片。`);
     }
+    this.applyMatrix(scene, this.contentTransform);
     this.applyUnlitMaterials(scene);
     return scene;
   }

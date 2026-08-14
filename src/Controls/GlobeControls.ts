@@ -191,7 +191,10 @@ export class GlobeControls extends EnvironmentControls {
     this.adjustCamera(camera);
 
     // 相机更新后对齐相机 up 向量。
-    if (adjustCameraRotation && (this._isNearControls() || this.state === FREE_ROTATE)) {
+    // 左键球面拖拽已通过“当前射线交点 → 初始 pivot”的旋转把相机姿态与
+    // 当前位置的局部 up 一起带过去。再次强制对齐 up 会在同一帧施加第二次
+    // 旋转；近地高层级下该微小修正会放大为可见抖动。
+    if (adjustCameraRotation && this.state !== DRAG && (this._isNearControls() || this.state === FREE_ROTATE)) {
       this.getCameraUpDirection(_globalUp);
       this._alignCameraUp(_globalUp, 1);
       this.getCameraUpDirection(_globalUp);
