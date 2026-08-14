@@ -78,9 +78,6 @@ async function bootstrap(): Promise<void> {
     initialTiles: [{ x: 0, y: 0, level: 0 }, { x: 1, y: 0, level: 0 }],
     onReady: (globe: Globe) => {
       (window as Window & { __globe?: Globe }).__globe = globe;
-      window.setInterval(() => {
-        document.body.dataset.globeStatistics = JSON.stringify(globe.statistics);
-      }, 500);
       globe.addImageryProvider(new WebMapTileServiceImageryProvider({
         url: 'https://{s}.tianditu.gov.cn/img_w/wmts?SERVICE=WMTS&REQUEST=GetTile&version=1.0.0&LAYER=img&tileMatrixSet=w&TileMatrix={TileMatrix}&TileRow={TileRow}&TileCol={TileCol}&style=default&tk=39d358c825ec7e59142958656c0a6864',
         subdomains: ['t0', 't1', 't2', 't3', 't4', 't5', 't6', 't7'],
