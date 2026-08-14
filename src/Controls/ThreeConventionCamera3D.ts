@@ -1,4 +1,16 @@
-import { CameraType, ComponentBase, Context3D, Frustum, Matrix4, Quaternion, Ray, Rect, Vector3, View3D } from '@orillusion/core';
+import {
+  CameraType,
+  ComponentBase,
+  Context3D,
+  CResizeEvent,
+  Frustum,
+  Matrix4,
+  Quaternion,
+  Ray,
+  Rect,
+  Vector3,
+  View3D,
+} from '@orillusion/core';
 import type { Camera3D, ILight } from '@orillusion/core';
 import { setRayFromCamera } from './controlsUtils.js';
 import type { Ray as ControlsRay } from './Ray.js';
@@ -46,6 +58,7 @@ export class ThreeConventionCamera3D extends ComponentBase {
   lookTarget = new Vector3(0, 0, 0);
   /** 相机绑定的图形上下文（多引擎场景使用；本相机由示例显式指定 view.camera）。 */
   _boundCtx: Context3D | null = null;
+  private _resizeListenerAttached = false;
 
   private _projectionMatrixInv = new Matrix4();
   private _projectionMatrix = new Matrix4();
@@ -128,12 +141,11 @@ export class ThreeConventionCamera3D extends ComponentBase {
   }
 
   override onEnable(view?: View3D): void {
-    const ctx = view?.engine3D?.context3D ?? this._boundCtx;
-    if (ctx) {
-      this._boundCtx = ctx;
-      const c = ctx.canvas;
-      this.viewPort = new Rect(0, 0, c.width, c.height);
-    }
+    this._bindToContext(view?.engine3D?.context3D ?? this._boundCtx ?? this.transform.view3D?.engine3D?.context3D);
+  }
+
+  override onDisable(): void {
+    this._unbindContext();
   }
 
   override onUpdate(): void {
@@ -143,10 +155,35 @@ export class ThreeConventionCamera3D extends ComponentBase {
   }
 
   updateProjection(): void {
+    const ctx = this._boundCtx ?? this.transform.view3D?.engine3D?.context3D;
+    if (ctx) {
+      this._boundCtx = ctx;
+      this.aspect = ctx.aspect;
+      this.viewPort = new Rect(0, 0, ctx.presentationSize[0], ctx.presentationSize[1]);
+    }
     if (this.type === CameraType.perspective) {
       this.perspective(this.fov, this.aspect, this.near, this.far);
     }
     this._projectionMatrixInv.copy(this._projectionMatrix).invert();
+  }
+
+  /** Mirror Camera3D's resize contract so custom projection never keeps a stale aspect ratio. */
+  private _bindToContext(ctx?: Context3D | null): void {
+    if (!ctx) return;
+    if (this._boundCtx !== ctx) this._unbindContext();
+    this._boundCtx = ctx;
+    if (!this._resizeListenerAttached) {
+      ctx.addEventListener(CResizeEvent.RESIZE, this.updateProjection, this);
+      this._resizeListenerAttached = true;
+    }
+    this.updateProjection();
+  }
+
+  private _unbindContext(): void {
+    if (this._boundCtx && this._resizeListenerAttached) {
+      this._boundCtx.removeEventListener(CResizeEvent.RESIZE, this.updateProjection, this);
+    }
+    this._resizeListenerAttached = false;
   }
 
   /** 透视相机（fork Matrix4 同款 LH 约定：x 列取负、w = z_view）。 */
@@ -234,6 +271,7 @@ export class ThreeConventionCamera3D extends ComponentBase {
   }
 
   override destroy(force?: boolean): void {
+    this._unbindContext();
     super.destroy(force);
   }
 }

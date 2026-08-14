@@ -466,6 +466,32 @@ export class Globe {
       uvs.set([uv.x, uv.y], index * 2);
       webMercatorUvs.set([uv.x, terrainMesh.encoding.decodeWebMercatorT(terrainMesh.vertices, index)], index * 2);
     }
+    if (!isFlatTerrain) {
+      // Cesium 在生成南北裙边时会向外偏移少量经纬度。重新量化后，裙边的
+      // WebMercator T 可从地表边界的 0/1 变成 -0.00005 / 1.00005；影像 shader
+      // 会将其判为越界而留下黑色。裙边应沿边界垂直拉伸，故仅复用对应地表
+      // 顶点的 WebMercator UV；位置、普通 UV 与所有三角形索引保持不变。
+      // surfaceVertexCount 在真实地形中包含裙边（需要参与正常绘制）；裙边数据在
+      // Cesium 顶点缓冲中的起点始终是“总顶点数 - 全部裙边顶点数”。
+      let skirtVertex = vertexCount - (
+        terrainMesh.westIndicesSouthToNorth.length +
+        terrainMesh.southIndicesEastToWest.length +
+        terrainMesh.eastIndicesNorthToSouth.length +
+        terrainMesh.northIndicesWestToEast.length
+      );
+      const skirtEdges = [
+        terrainMesh.westIndicesSouthToNorth,
+        terrainMesh.southIndicesEastToWest,
+        terrainMesh.eastIndicesNorthToSouth,
+        terrainMesh.northIndicesWestToEast,
+      ];
+      for (const edge of skirtEdges) {
+        for (let edgeIndex = 0; edgeIndex < edge.length; edgeIndex += 1, skirtVertex += 1) {
+          const surfaceVertex = edge[edgeIndex];
+          webMercatorUvs.set(webMercatorUvs.subarray(surfaceVertex * 2, surfaceVertex * 2 + 2), skirtVertex * 2);
+        }
+      }
+    }
     const geometry = new GeometryBase();
     geometry.setAttribute('position', positions);
     geometry.setAttribute('uv', uvs);

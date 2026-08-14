@@ -246,10 +246,20 @@ fn sampleLayer(
   colorToAlpha: vec4<f32>,
   cutoutRectangle: vec4<f32>
 ) -> vec4<f32> {
-  let layerUv = select(terrainUv, webMercatorUv, useWebMercator > 0.5);
-  if (layerUv.x < rectangle.x || layerUv.x > rectangle.z || layerUv.y < rectangle.y || layerUv.y > rectangle.w) {
+  var layerUv = select(terrainUv, webMercatorUv, useWebMercator > 0.5);
+  // 裙边在北/南方向上位于 WebMercator T 的 0/1 边界；纹理矩形和顶点解码的
+  // 浮点舍入可能仅相差数个 ULP。若直接剔除，该影像层没有任何混合结果，裙边
+  // 便显示为黑色。只接受极小的越界并夹到边缘，仍保留真正跨瓦片的剔除语义。
+  const uvBoundaryEpsilon = 1e-5;
+  if (
+    layerUv.x < rectangle.x - uvBoundaryEpsilon ||
+    layerUv.x > rectangle.z + uvBoundaryEpsilon ||
+    layerUv.y < rectangle.y - uvBoundaryEpsilon ||
+    layerUv.y > rectangle.w + uvBoundaryEpsilon
+  ) {
     return previousColor;
   }
+  layerUv = clamp(layerUv, rectangle.xy, rectangle.zw);
   if (cutoutRectangle.x != 0.0 || cutoutRectangle.z != 0.0) {
     if (layerUv.x >= cutoutRectangle.x && layerUv.x <= cutoutRectangle.z && layerUv.y >= cutoutRectangle.y && layerUv.y <= cutoutRectangle.w) {
       return previousColor;

@@ -1,4 +1,12 @@
-import { Engine3D, Object3D, Scene3D, Vector3, View3D } from '@orillusion/core';
+import {
+  EarthAtmRenderer,
+  Engine3D,
+  Object3D,
+  Scene3D,
+  SkyRenderer,
+  Vector3,
+  View3D,
+} from '@orillusion/core';
 import {
   Cartographic,
   Ellipsoid,
@@ -36,8 +44,16 @@ async function bootstrap(): Promise<void> {
   });
 
   const scene = new Scene3D();
+  // Follow Orillusion's Earth-atmosphere sample: the star map owns the scene's
+  // sky slot, while EarthAtmRenderer is a transparent scene-level overlay.
+  const sky = scene.addComponent(SkyRenderer);
+  void engine.res.loadLDRTextureCube('https://cdn.orillusion.com/images/space.webp')
+    .then((texture) => { sky.map = texture; })
+    .catch((error) => { console.warn('Unable to load the star-sky cubemap.', error); });
+
   const cameraObject = new Object3D();
-  const camera = cameraObject.addComponent(ThreeConventionCamera3D);
+  //@ts-ignore
+  const camera = window.camera = cameraObject.addComponent(ThreeConventionCamera3D);
   camera.perspective(60, engine.aspect, 1, 100_000_000);
   const cesiumInitialPosition = Ellipsoid.WGS84.cartographicToCartesian(
     Cartographic.fromDegrees(104.0, 35.0, 5_000_000),
@@ -77,11 +93,22 @@ async function bootstrap(): Promise<void> {
     },
   });
   scene.addChild(globeObject);
-
-  const view = new View3D();
+  //@ts-ignore
+  const view = window.view = new View3D();
   view.scene = scene;
   view.camera = camera as unknown as import('@orillusion/core').Camera3D;
   engine.startRenderView(view);
+
+  // EarthAtmRenderer must be registered on Scene3D, not as a child Object3D.
+  // This matches the official sample's transparent-overlay render path.
+  const atmosphere = scene.addComponent(EarthAtmRenderer);
+  atmosphere.configureForSpaceView();
+  atmosphere.earthRadius = 6_378_137;
+  atmosphere.atmosphereRadius = 6_478_137;
+  atmosphere.radius = atmosphere.atmosphereRadius * 1.5;
+  atmosphere.sunDirection = new Vector3(1, 0.3, 0.5);
+  atmosphere.sunIntensity = 22;
+  atmosphere.exposure = 1;
 }
 
 void bootstrap();
