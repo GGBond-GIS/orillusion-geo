@@ -9,6 +9,7 @@ import {
   Vector3,
   View3D,
 } from '@orillusion/core';
+import { Stats } from '@orillusion/stats';
 import {
   Cartographic,
   Ellipsoid,
@@ -33,6 +34,7 @@ const tilesetUrl = `${sampleRoot}/dayanpagoda-3dtiles-1_1/tileset.json`;
 
 /** 在同一 Orillusion 场景中加载 Cesium World Terrain 与原始坐标的 3D Tiles。 */
 async function bootstrap(): Promise<void> {
+  let stats: Stats | null = null;
   Ion.defaultAccessToken = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJlZmU5MWMwNS02YjY5LTRiNjAtOTFlNi0xM2NmNWZjZTc1ZDQiLCJpZCI6MzY2MDc1LCJpYXQiOjE3NjQ3MzYwOTV9.6Mjjy2V6NMudcsH9vQsYvMFDtcSdmG58ixc6dc19kEo';
   const terrainProvider = await createWorldTerrainAsync({
     requestVertexNormals: false,
@@ -41,6 +43,9 @@ async function bootstrap(): Promise<void> {
 
   configureGlobeRendering({ matrixCapacity: 4_096 });
   const engine = await Engine3D.init({
+    // @orillusion/stats 仍使用官方面板与采样逻辑；当前 core 的更新表按 View3D
+    // 分组，直接 addComponent(Stats) 只初始化画布而不会持续调用 onUpdate。
+    lateRender: () => stats?.onUpdate(),
     setting: {
         useRTE: true,            // 开启相对相机渲染
         RTEScale: 1.0,           // RTE 坐标缩放系数，一般保持默认
@@ -51,6 +56,9 @@ async function bootstrap(): Promise<void> {
         },
     },
 });
+
+  stats = new Stats();
+  stats.init();
 
   const scene = new Scene3D();
   const sky = scene.addComponent(SkyRenderer);

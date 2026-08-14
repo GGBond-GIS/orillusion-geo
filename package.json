@@ -23,7 +23,8 @@
   "dependencies": {
     "3d-tiles-renderer": "0.5.1",
     "@cesium/engine": "22.1.0",
-    "@orillusion/core": "0.9.2"
+    "@orillusion/core": "0.9.2",
+    "@orillusion/stats": "0.3.0"
   },
   "devDependencies": {
     "typescript": "~5.9.3",

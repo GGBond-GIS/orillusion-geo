@@ -17,6 +17,9 @@ importers:
       '@orillusion/core':
         specifier: 0.9.2
         version: 0.9.2
+      '@orillusion/stats':
+        specifier: 0.3.0
+        version: 0.3.0(@orillusion/core@0.9.2)
     devDependencies:
       typescript:
         specifier: ~5.9.3
@@ -228,6 +231,11 @@ packages:
 
   '@orillusion/core@0.9.2':
     resolution: {integrity: sha512-DAnexESO8/yU3PbW1dyyKOnQLufnXQjW2XJSJQndpV6R5wqXZeDllhqH2ez6ajSFHy0iWheY83Ul2X1hr4PdNw==}
+
+  '@orillusion/stats@0.3.0':
+    resolution: {integrity: sha512-Zy+LDnIwwKAky90GTFVyXBRZcXbxmlJ93Zb3+wVFmY1YMEDk8MIX4ifmOoNOyWdwfl0QKce94xs5mgeLCNCccQ==}
+    peerDependencies:
+      '@orillusion/core': '>=0.9.0'
 
   '@protobufjs/aspromise@1.1.2':
     resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
@@ -720,6 +728,10 @@ snapshots:
     optional: true
 
   '@orillusion/core@0.9.2': {}
+
+  '@orillusion/stats@0.3.0(@orillusion/core@0.9.2)':
+    dependencies:
+      '@orillusion/core': 0.9.2
 
   '@protobufjs/aspromise@1.1.2': {}
 

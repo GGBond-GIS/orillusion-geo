@@ -1,4 +1,4 @@
-import { Camera3D, ColliderComponent, Engine3D, GeometryBase, MeshColliderShape, MeshRenderer, Object3D, UnLitMaterial, Vector3, setFrameDelay } from '@orillusion/core';
+import { Camera3D, ColliderComponent, Engine3D, GeometryBase, Matrix4, MeshColliderShape, MeshRenderer, Object3D, UnLitMaterial, Vector3, setFrameDelay } from '@orillusion/core';
 import { Cartesian2, Cartesian3, Cartesian4, EllipsoidTerrainProvider, ImageryLayerCollection, type ImageryLayer, type ImageryProvider, type TerrainProvider } from '@cesium/engine';
 import { CesiumGlobeTileMaterial, type CesiumGlobeTileTexture } from '../Renderer/CesiumGlobeTileMaterial.js';
 import { CesiumFrameTaskQueue } from '../Scheduler/CesiumFrameTaskQueue.js';
@@ -54,6 +54,10 @@ export interface GlobeStatistics {
   pendingReprojections: number;
   pendingTerrainCommits: number;
   pendingMaterialCommits: number;
+  /** 当前仍占用的 Orillusion 全局矩阵槽位（已销毁对象的槽位已扣除）。 */
+  activeMatrixCount: number;
+  /** 等待安全帧边界和 GPU fence 的退役资源数量。 */
+  pendingResourceRetirements: number;
   loadQueueHighLength: number;
   loadQueueMediumLength: number;
   loadQueueLowLength: number;
@@ -97,6 +101,10 @@ export class Globe {
   private readonly options: GlobeOptions;
   private lastSelected: number[] = [];
   private frameNumber = 0;
+  private disposed = false;
+  /** 合并同一批淘汰资源的延迟销毁与 GPU fence，避免每瓦片创建一条 Promise 链。 */
+  private readonly retiredResourceFinalizers: Array<() => void> = [];
+  private retirementFlushScheduled = false;
 
   /** GlobeTileAccessor：把 Cesium QuadtreeTile / GlobeSurfaceTile 的只读面暴露给选择器。 */
   private readonly accessor: GlobeTileAccessor = {
@@ -147,9 +155,10 @@ export class Globe {
       return this.surfaceTiles.get(key)?.boundingVolume ?? undefined;
     },
     getHeightRange: (key) => {
-      const mesh = this.surfaceTiles.get(key)?.mesh;
-      if (mesh && Number.isFinite(mesh.minimumHeight) && Number.isFinite(mesh.maximumHeight)) {
-        return mesh;
+      const tile = this.surfaceTiles.get(key);
+      if (tile && tile.minimumHeight !== null && tile.maximumHeight !== null
+        && Number.isFinite(tile.minimumHeight) && Number.isFinite(tile.maximumHeight)) {
+        return { minimumHeight: tile.minimumHeight, maximumHeight: tile.maximumHeight };
       }
       return undefined;
     },
@@ -277,6 +286,8 @@ export class Globe {
       pendingReprojections: imageryStatistics.pendingReprojections,
       pendingTerrainCommits: this.terrainCommitQueue.statistics.pending,
       pendingMaterialCommits: this.materialCommitQueue.statistics.pending,
+      activeMatrixCount: Matrix4.useCount - (Matrix4 as unknown as { freeIndexOffset: number }).freeIndexOffset,
+      pendingResourceRetirements: this.retiredResourceFinalizers.length,
       loadQueueHighLength: this.lastTraversal?.loadQueueHigh.length ?? 0,
       loadQueueMediumLength: this.lastTraversal?.loadQueueMedium.length ?? 0,
       loadQueueLowLength: this.lastTraversal?.loadQueueLow.length ?? 0,
@@ -287,6 +298,8 @@ export class Globe {
 
   /** 释放 ECS、Cesium 引用、GPU 纹理和所有待执行闭包。 */
   public dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
     this.terrainCommitQueue.clear();
     this.materialCommitQueue.clear();
     const imageryToDispose = [...this.surfaceImagery.values()];
@@ -415,6 +428,9 @@ export class Globe {
       const object = this.createTerrainObject(tile.mesh, tile.key);
       this.tiles.set(key, object);
       this.group.addChild(object);
+      // Geometry 已持有解码后的独立 position/uv/index 数组；四叉树只需保留包围球和
+      // 高程区间，不应让每个缓存瓦片继续持有 Worker 的压缩顶点缓冲。
+      tile.releaseMeshBuffers();
       this.resolveTileLoadWaiters(key, object);
     }).catch(() => { this.queuedTerrainCommits.delete(key); });
   }
@@ -457,9 +473,15 @@ export class Globe {
     for (let index = 0; index < surfaceVertexCount; index += 1) {
       terrainMesh.encoding.decodePosition(terrainMesh.vertices, index, position);
       terrainMesh.encoding.decodeTextureCoordinates(terrainMesh.vertices, index, uv);
-      positions.set([position.x - center.x, position.y - center.y, position.z - center.z], index * 3);
-      uvs.set([uv.x, uv.y], index * 2);
-      webMercatorUvs.set([uv.x, terrainMesh.encoding.decodeWebMercatorT(terrainMesh.vertices, index)], index * 2);
+      const positionOffset = index * 3;
+      positions[positionOffset] = position.x - center.x;
+      positions[positionOffset + 1] = position.y - center.y;
+      positions[positionOffset + 2] = position.z - center.z;
+      const uvOffset = index * 2;
+      uvs[uvOffset] = uv.x;
+      uvs[uvOffset + 1] = uv.y;
+      webMercatorUvs[uvOffset] = uv.x;
+      webMercatorUvs[uvOffset + 1] = terrainMesh.encoding.decodeWebMercatorT(terrainMesh.vertices, index);
     }
     if (!isFlatTerrain) {
       // Cesium 在生成南北裙边时会向外偏移少量经纬度。重新量化后，裙边的
@@ -483,7 +505,10 @@ export class Globe {
       for (const edge of skirtEdges) {
         for (let edgeIndex = 0; edgeIndex < edge.length; edgeIndex += 1, skirtVertex += 1) {
           const surfaceVertex = edge[edgeIndex];
-          webMercatorUvs.set(webMercatorUvs.subarray(surfaceVertex * 2, surfaceVertex * 2 + 2), skirtVertex * 2);
+          const sourceOffset = surfaceVertex * 2;
+          const targetOffset = skirtVertex * 2;
+          webMercatorUvs[targetOffset] = webMercatorUvs[sourceOffset];
+          webMercatorUvs[targetOffset + 1] = webMercatorUvs[sourceOffset + 1];
         }
       }
     }
@@ -491,7 +516,9 @@ export class Globe {
     geometry.setAttribute('position', positions);
     geometry.setAttribute('uv', uvs);
     geometry.setAttribute('TEXCOORD_1', webMercatorUvs);
-    geometry.setIndices(isFlatTerrain ? terrainMesh.indices.subarray(0, indexCount) : terrainMesh.indices);
+    // flat terrain 去掉裙边时必须复制有效索引；subarray 会让 Geometry 长期保留整个
+    // Worker 索引 ArrayBuffer，导致 releaseMeshBuffers 后大缓冲仍无法回收。
+    geometry.setIndices(isFlatTerrain ? terrainMesh.indices.slice(0, indexCount) : terrainMesh.indices);
     geometry.addSubGeometry({ indexStart: 0, indexCount, vertexStart: 0, vertexCount: surfaceVertexCount, firstStart: 0, index: 0, topology: 0 });
     const object = new Object3D();
     object.name = `Terrain ${coordinate.level}/${coordinate.x}/${coordinate.y}`;
@@ -731,16 +758,29 @@ export class Globe {
       geometry?.destroy(true);
       if (material) {
         material.resetForPool(this.options.engine.res.whiteTexture);
-        this.recycledMaterials.push(material);
+        if (this.disposed) material.destroy(true);
+        else this.recycledMaterials.push(material);
       }
       imagery?.dispose();
       tile.freeResources();
       this.imageryRuntime.releaseUnused();
     };
-    void setFrameDelay(2)
-      .then(() => this.options.engine.context3D.device.queue.onSubmittedWorkDone())
-      .then(finalize)
-      .catch(finalize);
+    this.retiredResourceFinalizers.push(finalize);
+    this.scheduleRetirementFlush();
+  }
+
+  /** 将一批退役资源合并到同一个安全帧边界和 GPU fence 后销毁。 */
+  private scheduleRetirementFlush(): void {
+    if (this.retirementFlushScheduled) return;
+    this.retirementFlushScheduled = true;
+    void setFrameDelay(2).then(() => {
+      const batch = this.retiredResourceFinalizers.splice(0);
+      const flush = (): void => { for (const finalize of batch) finalize(); };
+      return this.options.engine.context3D.device.queue.onSubmittedWorkDone().then(flush, flush);
+    }).finally(() => {
+      this.retirementFlushScheduled = false;
+      if (this.retiredResourceFinalizers.length > 0) this.scheduleRetirementFlush();
+    });
   }
 
   /** 瓦片实体创建完成时兑现 loadTile 等待者。 */

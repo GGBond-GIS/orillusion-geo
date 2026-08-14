@@ -576,8 +576,19 @@ export class CesiumSurfaceImagery {
    */
   private createTexture(managed: ManagedImagery): void {
     if (!managed.image) { managed.state = ImageryState.Invalid; return; }
+    const image = managed.image;
     const texture = new BitmapTexture2D(true, this.options.context, 'srgb');
-    texture.source = managed.image;
+    texture.source = image;
+    // Cesium Resource 通常返回 ImageBitmap。Orillusion 会同时把它保存在 `_source` 和
+    // `_sourceImageData`，即使 GPU 上传完成也不清空，数百张瓦片会因此长期占用原生
+    // 解码内存。先强制物化并排入 copyExternalImageToTexture/mipmap，再关闭并断开 CPU 源。
+    if (typeof ImageBitmap !== 'undefined' && image instanceof ImageBitmap) {
+      texture.getGPUTexture();
+      image.close();
+      const releasable = texture as unknown as { _source?: unknown; _sourceImageData?: unknown };
+      releasable._source = undefined;
+      releasable._sourceImageData = undefined;
+    }
     if (managed.source.imageryLayer.imageryProvider.tilingScheme.projection instanceof WebMercatorProjection) managed.textureWebMercator = texture;
     else managed.texture = texture;
     managed.image = undefined;

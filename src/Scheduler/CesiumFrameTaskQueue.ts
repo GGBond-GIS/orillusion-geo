@@ -21,6 +21,7 @@ interface DeferredTask {
  */
 export class CesiumFrameTaskQueue {
   private readonly tasks: DeferredTask[] = [];
+  private head = 0;
   private completedValue = 0;
   /** 每帧允许使用的主线程时间片，单位为毫秒。 */
   public timeSliceMilliseconds: number;
@@ -50,8 +51,8 @@ export class CesiumFrameTaskQueue {
   public process(maximumTasks = Number.POSITIVE_INFINITY): number {
     const endTime = performance.now() + this.timeSliceMilliseconds;
     let processed = 0;
-    while (this.tasks.length > 0 && processed < maximumTasks && (processed === 0 || performance.now() < endTime)) {
-      const task = this.tasks.shift() as DeferredTask;
+    while (this.head < this.tasks.length && processed < maximumTasks && (processed === 0 || performance.now() < endTime)) {
+      const task = this.tasks[this.head++];
       try {
         task.execute();
         task.resolve();
@@ -61,14 +62,23 @@ export class CesiumFrameTaskQueue {
       processed += 1;
       this.completedValue += 1;
     }
+    // 避免 Array.shift 的 O(n) 搬移；消费较多后再一次性压缩队列。
+    if (this.head === this.tasks.length) {
+      // 立即解除已执行闭包对瓦片、纹理和网格的引用。
+      this.tasks.length = 0;
+      this.head = 0;
+    } else if (this.head > 256 && this.head * 2 >= this.tasks.length) {
+      this.tasks.splice(0, this.head);
+      this.head = 0;
+    }
     return processed;
   }
 
   /** 清空尚未执行的任务，供 Globe 销毁时断开闭包引用。 */
-  public clear(): void { this.tasks.length = 0; }
+  public clear(): void { this.tasks.length = 0; this.head = 0; }
 
   /** 返回队列稳定性测试所需的计数。 */
   public get statistics(): FrameTaskQueueStatistics {
-    return { pending: this.tasks.length, completed: this.completedValue };
+    return { pending: this.tasks.length - this.head, completed: this.completedValue };
   }
 }

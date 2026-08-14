@@ -13,6 +13,8 @@ export interface CesiumTerrainMesh {
   minimumHeight: number;
   /** Highest source height represented by this tile, in metres above the ellipsoid. */
   maximumHeight: number;
+  /** Worker 已计算好的地形包围球；直接复用可避免主线程再次解码全部顶点。 */
+  boundingSphere3D: BoundingSphere;
   /** 每个顶点的元素数量。 */
   stride: number;
   /** Cesium TerrainEncoding 解码器。 */
@@ -55,6 +57,10 @@ export class CesiumSurfaceTile {
   public terrainData: TerrainData | null = null;
   /** Cesium Worker 输出网格。 */
   public mesh: CesiumTerrainMesh | null = null;
+  /** Worker 网格提交 GPU 后仍需供四叉树选择使用的最小高程。 */
+  public minimumHeight: number | null = null;
+  /** Worker 网格提交 GPU 后仍需供四叉树选择使用的最大高程。 */
+  public maximumHeight: number | null = null;
   /**
    * 对齐 Cesium QuadtreeTile.upsampledFromParent：
    * 地形数据由父级上采样产生（terrainData.wasCreatedByUpsampling），
@@ -132,6 +138,8 @@ export class CesiumSurfaceTile {
     if (this.pending) return;
     this.terrainData = null;
     this.mesh = null;
+    this.minimumHeight = null;
+    this.maximumHeight = null;
     this.boundingVolume = null;
     this.upsampledFromParent = false;
     this.state = TerrainTileState.Unloaded;
@@ -199,47 +207,17 @@ export class CesiumSurfaceTile {
     this.state = TerrainTileState.Transforming;
     this.pending = request.then(mesh => {
       this.mesh = mesh;
-      // 对齐 Cesium TileBoundingRegion：地形就绪后按真实顶点计算包围球，
-      // 供选择器做 SSE 距离、视锥剔除与加载优先级，未就绪时由调用方回退父级。
-      this.boundingVolume = this.computeBoundingSphere(mesh);
+      this.minimumHeight = mesh.minimumHeight;
+      this.maximumHeight = mesh.maximumHeight;
+      // TerrainMesh 的 Worker 已计算 boundingSphere3D。复用该结果，避免在主线程为了
+      // 同一个包围球额外解码两遍全部顶点（随后 GPU 提交还会再解码一遍）。
+      this.boundingVolume = BoundingSphere.clone(mesh.boundingSphere3D);
       this.state = TerrainTileState.Transformed;
     }).catch(() => {
       this.state = TerrainTileState.Failed;
     }).finally(() => { this.pending = null; });
   }
 
-  /**
-   * 用 Cesium TerrainEncoding 解码全部顶点并计算 ECEF 包围球。
-   * 与 Cesium BoundingSphere.fromVertices 相同：中心取顶点均值，半径为最大距离。
-   * @param mesh Cesium Worker 输出的网格。
-   * @returns 覆盖真实地形的包围球。
-   */
-  private computeBoundingSphere(mesh: CesiumTerrainMesh): BoundingSphere {
-    const vertexCount = mesh.vertices.length / mesh.stride;
-    const position = new Cartesian3();
-    let center = Cartesian3.ZERO.clone();
-    if (vertexCount > 0) {
-      let sx = 0;
-      let sy = 0;
-      let sz = 0;
-      for (let index = 0; index < vertexCount; index += 1) {
-        mesh.encoding.decodePosition(mesh.vertices, index, position);
-        sx += position.x;
-        sy += position.y;
-        sz += position.z;
-      }
-      const inverse = 1 / vertexCount;
-      center = new Cartesian3(sx * inverse, sy * inverse, sz * inverse);
-    }
-    let radius = 0;
-    for (let index = 0; index < vertexCount; index += 1) {
-      mesh.encoding.decodePosition(mesh.vertices, index, position);
-      const dx = position.x - center.x;
-      const dy = position.y - center.y;
-      const dz = position.z - center.z;
-      const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (distance > radius) radius = distance;
-    }
-    return new BoundingSphere(center, radius);
-  }
+  /** GPU 几何已拥有解码后的数组后，释放 Worker TerrainMesh 的大块 CPU 缓冲。 */
+  public releaseMeshBuffers(): void { this.mesh = null; }
 }
