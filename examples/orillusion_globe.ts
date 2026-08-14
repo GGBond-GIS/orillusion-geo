@@ -41,6 +41,8 @@ async function bootstrap(): Promise<void> {
   cameraObject.addComponent(GlobeControls, {
     camera,
     domElement: engine.context3D.canvas,
+    // 传入 scene：控制器内部拾取（ray-pick Raycaster）命中地形网格三角形。
+    scene,
     // 原版语义：相机到缩放点（地表）的最小距离，100 m 允许放大到贴地高度。
     minDistance: 100,
     // 关闭阻尼惯性：拖拽/旋转松开后立即停止（原版 enableDamping 会带惯性继续转）。

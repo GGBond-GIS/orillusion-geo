@@ -18,3 +18,7 @@ export { TerrainTileState, type TerrainTileKey } from './Terrain/TerrainTileStat
 export { configureCesiumWorkerRuntime } from './Terrain/CesiumWorkerRuntime.js';
 export { CesiumImageryRuntime, CesiumSurfaceImagery, type CesiumSurfaceImageryOptions } from './Terrain/CesiumImagerySkeleton.js';
 export { GlobeQuadtree, type GlobeQuadtreeOptions } from './Terrain/GlobeQuadtree.js';
+export { Raycaster } from './ray-pick/Raycaster.js';
+export type { RaycastHit, RaycastFace } from './ray-pick/RaycastHit.js';
+export { SceneRayPick } from './ray-pick/SceneRayPick.js';
+export { installRayPick, uninstallRayPick, installGraphicRayPick } from './ray-pick/installRayPick.js';

@@ -3,7 +3,8 @@ import { Ellipsoid, WGS84_ELLIPSOID } from '../Math/Ellipsoid.js';
 import { DRAG, EnvironmentControls, FREE_ROTATE, NONE, ZOOM, type EnvironmentControlsOptions } from './EnvironmentControls.js';
 import { fwdDotEarth, uvOf } from './controlsDebug.js';
 import { Ray } from './Ray.js';
-import { adjustedPointerToCoords, clamp, lerp, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera } from './controlsUtils.js';
+import type { Raycaster } from '../ray-pick/Raycaster.js';
+import { adjustedPointerToCoords, clamp, lerp, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera, setRaycasterFromCamera } from './controlsUtils.js';
 
 let _invMatrix!: Matrix4;
 // Matrix4 依赖 Engine3D.init 之后的全局矩阵池，模块级创建会在 init 前崩溃；
@@ -375,10 +376,12 @@ export class GlobeControls extends EnvironmentControls {
       const pivotDir = _pos;
       const newPivotDir = _targetRight;
 
-      // 取指针与射线。
+      // 取指针与射线（与 3d-tiles-renderer 原版一致：射线来自 raycaster）。
       pointerTracker.getCenterPoint(_pointer);
       adjustedPointerToCoords(_pointer, domElement, _pointer);
-      setRayFromCamera(_ray, _pointer, camera);
+      setRaycasterFromCamera(this.raycaster, _pointer, camera);
+      _ray.origin.copy(this.raycaster.ray.origin);
+      _ray.direction.copy(this.raycaster.ray.direction);
 
       // 变换到椭球坐标系。
       _ray.applyMatrix4(ellipsoidFrameInverse);
@@ -606,18 +609,20 @@ export class GlobeControls extends EnvironmentControls {
     return this.getDistanceToCenter() < this._getPerspectiveTransitionDistance();
   }
 
-  public override _raycast(ray: Ray): { point: Vector3; distance: number } | null {
+  public override _raycast(raycaster: Raycaster): { point: Vector3; distance: number } | null {
     ensureScratchMatrices();
-    const result = super._raycast(ray);
+    const result = super._raycast(raycaster);
     if (result === null) {
-      // 场景未命中时回退到椭球相交。
+      // 场景未命中时回退到椭球相交（与 3d-tiles-renderer 原版一致）。
       const { ellipsoid, ellipsoidFrame, ellipsoidFrameInverse } = this;
-      _ray.copy(ray).applyMatrix4(ellipsoidFrameInverse);
+      _ray.origin.copy(raycaster.ray.origin);
+      _ray.direction.copy(raycaster.ray.direction);
+      _ray.applyMatrix4(ellipsoidFrameInverse);
 
       const point = ellipsoid.intersectRay(_ray, _vec);
       if (point !== null) {
         point.applyMatrix4(ellipsoidFrame);
-        return { point: point.clone(), distance: point.distanceTo(ray.origin) };
+        return { point: point.clone(), distance: point.distanceTo(raycaster.ray.origin) };
       }
       return null;
     }

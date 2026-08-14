@@ -66,6 +66,8 @@ async function bootstrap(): Promise<void> {
   cameraObject.addComponent(GlobeControls, {
     camera,
     domElement: engine.context3D.canvas,
+    // 传入 scene：控制器内部拾取（ray-pick Raycaster）命中地形网格三角形。
+    scene,
     minDistance: 100,
     enableDamping: false,
   });

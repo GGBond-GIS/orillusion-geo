@@ -1,9 +1,11 @@
-import { Camera3D, ColliderComponent, Color, ComponentBase, Matrix4, MeshRenderer, Object3D, PlaneGeometry, Quaternion, Ray as EngineRay, UnLitMaterial, Vector2, Vector3 } from '@orillusion/core';
+import { Camera3D, Color, ComponentBase, Matrix4, MeshRenderer, Object3D, PlaneGeometry, Quaternion, UnLitMaterial, Vector2, Vector3 } from '@orillusion/core';
 import { PointerTracker } from './PointerTracker.js';
 import { Plane } from './Plane.js';
 import { Ray } from './Ray.js';
 import { ControlsDebug, fwdDotEarth, uvOf, type DebugLogOptions } from './controlsDebug.js';
-import { adjustedPointerToCoords, clamp, decomposeMatrix4, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera } from './controlsUtils.js';
+import { adjustedPointerToCoords, clamp, decomposeMatrix4, makeRotateAroundPoint, mapLinear, RAD2DEG, setRayFromCamera, setRaycasterFromCamera } from './controlsUtils.js';
+import { Raycaster } from '../ray-pick/Raycaster.js';
+import { installRayPick } from '../ray-pick/installRayPick.js';
 
 export const NONE = 0;
 export const DRAG = 1;
@@ -41,7 +43,6 @@ const _identityQuat = new Quaternion();
 const _ray = new Ray();
 const _flightDir = new Vector3();
 let _cameraMatrix!: Matrix4;
-const _engineRay = new EngineRay(new Vector3(), new Vector3());
 
 const _pointer = new Vector2();
 const _screenCenter = new Vector2();
@@ -161,10 +162,23 @@ export class EnvironmentControls extends ComponentBase {
   private _lastUsedState = NONE;
   private _zoomPointWasSet = false;
   private readonly _listeners: Record<string, Array<(event: { type: string }) => void>> = {};
+  private _raycaster: Raycaster | null = null;
+
+  /** ray-pick 场景射线拾取器（惰性创建：Raycaster 内部含 Matrix4，须在 Engine3D.init 之后实例化）。 */
+  protected get raycaster(): Raycaster {
+    if (!this._raycaster) {
+      this._raycaster = new Raycaster();
+      // 控制器只取最近命中（_raycast 的 [0]）→ 启用 three.js 式首次碰撞剪枝
+      this._raycaster.firstHitOnly = true;
+    }
+    return this._raycaster;
+  }
 
   // ---- ECS 生命周期 ----
 
   public override init(options: EnvironmentControlsOptions): void {
+    // 注入 ray-pick 的 raycast 方法到核心渲染器原型（幂等，可重复调用）。
+    installRayPick();
     this.camera = options.camera;
     this.domElement = options.domElement;
     if (options.rig !== undefined) this.cameraRig = options.rig;
@@ -313,10 +327,10 @@ export class EnvironmentControls extends ComponentBase {
       // 缩放与旋转的“指针”基于中心点。
       pointerTracker.getCenterPoint(_pointer);
       adjustedPointerToCoords(_pointer, domElement, _pointer);
-      setRayFromCamera(_ray, _pointer, camera);
+      setRaycasterFromCamera(this.raycaster, _pointer, camera);
 
       // 用拖拽平面限制拖拽距离，防止过大的拖拽角。
-      const dot = Math.abs(_ray.direction.dot(up));
+      const dot = Math.abs(this.raycaster.ray.direction.dot(up));
       if (dot < DRAG_PLANE_THRESHOLD || dot < DRAG_UP_THRESHOLD) {
         return;
       }
@@ -342,7 +356,7 @@ export class EnvironmentControls extends ComponentBase {
       // 求命中点。判空：左键拖拽与右键旋转都必须在命中点存在时才进入——
       // 未命中（点击太空/地平线外）直接结束，否则会绕垃圾枢轴旋转/拖拽，
       // 相机被带飞。
-      const hit = this._raycast(_ray);
+      const hit = this._raycast(this.raycaster);
       // 调试:按下事件的命中信息与 uv(经纬度等距柱状映射)。
       this.debugLog?.steps(() =>
         hit
@@ -362,8 +376,8 @@ export class EnvironmentControls extends ComponentBase {
         // 否则在非屏幕中心处按下时，轨道绕屏幕边缘的点转，视角会闪动/漂移；
         // 中心点配合 _alignCameraUp/_clampRotation 的固定点补偿，旋转全程
         // 把屏幕中心锁死在视野中央（Cesium target 同款手感）。
-        setRayFromCamera(_ray, _screenCenter, camera);
-        const centerHit = this._raycast(_ray);
+        setRaycasterFromCamera(this.raycaster, _screenCenter, camera);
+        const centerHit = this._raycast(this.raycaster);
         const rotatePoint = centerHit ? centerHit.point : hit.point;
         pivotPoint.copy(rotatePoint);
         // 调试:右键旋转的 pivot。
@@ -586,10 +600,10 @@ export class EnvironmentControls extends ComponentBase {
 
     // 无结果或射线命中更近时，回退到屏幕中心射线命中点。
     if (camera) {
-      setRayFromCamera(_ray, _screenCenter, camera);
-      const hit = this._raycast(_ray);
+      setRaycasterFromCamera(this.raycaster, _screenCenter, camera);
+      const hit = this._raycast(this.raycaster);
       if (hit) {
-        if (result === null || hit.distance < result.distanceTo(_ray.origin)) {
+        if (result === null || hit.distance < result.distanceTo(this.raycaster.ray.origin)) {
           result = target.copy(hit.point);
         }
       }
@@ -785,6 +799,9 @@ export class EnvironmentControls extends ComponentBase {
       material.doubleSide = true;
       renderer.material = material;
       object.transform.localScale = new Vector3(0.25, 0.25, 0.25);
+      // 与 3d-tiles-renderer 原版一致：枢轴指示器不参与射线拾取，
+      // 否则它会拦截指向地表的射线（ray-pick 按组件 raycast 派发）。
+      (renderer as unknown as { raycast?: () => void }).raycast = () => {};
       this.pivotMesh = object;
       this._pivotRenderer = renderer;
     }
@@ -1027,8 +1044,8 @@ export class EnvironmentControls extends ComponentBase {
       );
     });
     adjustedPointerToCoords(_pointer, domElement, _pointer);
-    setRayFromCamera(_ray, _pointer, camera);
-    zoomDirection.copy(_ray.direction).normalize();
+    setRaycasterFromCamera(this.raycaster, _pointer, camera);
+    zoomDirection.copy(this.raycaster.ray.direction).normalize();
     this.zoomDirectionSet = true;
   }
 
@@ -1045,11 +1062,14 @@ export class EnvironmentControls extends ComponentBase {
 
     if (!zoomDirectionSet || !this.camera) return false;
 
-    _ray.origin.copy(this.getCameraPosition());
-    _ray.direction.copy(zoomDirection);
+    // 与 3d-tiles-renderer 原版一致：直接用 raycaster 的射线求交。
+    this.raycaster.ray.origin.copy(this.getCameraPosition());
+    this.raycaster.ray.direction.copy(zoomDirection);
+    this.raycaster.near = 0;
+    this.raycaster.far = Infinity;
 
     // 求命中点。
-    const hit = this._raycast(_ray);
+    const hit = this._raycast(this.raycaster);
     if (hit) {
       zoomPoint.copy(hit.point);
       this.zoomPointSet = true;
@@ -1079,7 +1099,11 @@ export class EnvironmentControls extends ComponentBase {
       adjustedPointerToCoords(_pointer, domElement, _pointer);
 
       _plane.setFromNormalAndCoplanarPoint(up, pivotPoint);
-      setRayFromCamera(_ray, _pointer, camera);
+      // 与 3d-tiles-renderer 原版一致：射线来自 raycaster（引擎 Ray 无
+      // intersectPlane，拷到 fork Ray 上做平面求交）。
+      setRaycasterFromCamera(this.raycaster, _pointer, camera);
+      _ray.origin.copy(this.raycaster.ray.origin);
+      _ray.direction.copy(this.raycaster.ray.direction);
 
       // 拖拽角过大时把射线方向压回平面法线附近的合理角度。
       if (Math.abs(_ray.direction.dot(up)) < DRAG_PLANE_THRESHOLD) {
@@ -1280,41 +1304,27 @@ export class EnvironmentControls extends ComponentBase {
     up.copy(newUp);
   }
 
-  /** 场景射线（可选，经 ColliderComponent 网格求交）与回退平面。 */
-  protected _raycast(ray: Ray): { point: Vector3; distance: number } | null {
+  /** 场景射线（ray-pick Raycaster，CPU 三角形求交）与回退平面。 */
+  protected _raycast(raycaster: Raycaster): { point: Vector3; distance: number } | null {
     ensureScratchMatrices();
-    const { useFallbackPlane, fallbackPlane } = this;
+    const { scene, useFallbackPlane, fallbackPlane } = this;
 
-    const result = this._raycastScene(ray);
-    if (result) return result;
+    const result = scene ? (raycaster.intersectObject(scene, true)[0] || null) : null;
+    if (result) {
+      return { point: result.point, distance: result.distance };
+    }
 
     if (useFallbackPlane) {
-      const point = ray.intersectPlane(fallbackPlane.normal, fallbackPlane.constant, _vec);
+      // 引擎 Ray 没有 intersectPlane，拷到 fork Ray 上做平面求交。
+      _ray.origin.copy(raycaster.ray.origin);
+      _ray.direction.copy(raycaster.ray.direction);
+      const point = _ray.intersectPlane(fallbackPlane.normal, fallbackPlane.constant, _vec);
       if (point) {
-        return { point: _vec.clone(), distance: ray.origin.distanceTo(_vec) };
+        return { point: _vec.clone(), distance: raycaster.ray.origin.distanceTo(_vec) };
       }
     }
 
     return null;
-  }
-
-  private _raycastScene(ray: Ray): { point: Vector3; distance: number } | null {
-    const root = this.scene;
-    if (!root) return null;
-
-    const colliders = root.getComponentsInChild(ColliderComponent);
-    let best: { point: Vector3; distance: number } | null = null;
-    for (const collider of colliders) {
-      _engineRay.origin.copy(ray.origin);
-      _engineRay.direction.copy(ray.direction);
-      const hit = collider.rayPick(_engineRay);
-      if (!hit || !hit.intersectPoint) continue;
-      const distance = hit.distance ?? ray.origin.distanceTo(hit.intersectPoint);
-      if (best === null || distance < best.distance) {
-        best = { point: hit.intersectPoint, distance };
-      }
-    }
-    return best;
   }
 
   // 把相机 up 对齐到给定方向。

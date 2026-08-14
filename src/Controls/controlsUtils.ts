@@ -1,4 +1,5 @@
 import { Camera3D, Matrix4, Quaternion, Vector2, Vector3 } from '@orillusion/core';
+import type { Raycaster } from '../ray-pick/Raycaster.js';
 import { Ray } from './Ray.js';
 
 let _matrix!: Matrix4;
@@ -94,6 +95,31 @@ export function setRayFromCamera(ray: Ray, coords: { x: number; y: number }, cam
   direction.set(coords.x / a0, coords.y / a5, 1).transformDirection(_matrix);
   origin.copy(camera.object3D.transform.worldPosition);
   return ray;
+}
+
+/**
+ * 由相机与 NDC 坐标设置 ray-pick `Raycaster` 的射线（origin 为相机位置，
+ * direction 指向场景内）。数学与 `setRayFromCamera` 完全一致（fork 渲染管线
+ * 的标定约定），只是写入 ray-pick 包自带的引擎 Ray（`raycaster.ray`），供
+ * `raycaster.intersectScene` 做 CPU 三角形求交。
+ */
+export function setRaycasterFromCamera(raycaster: Raycaster, coords: { x: number; y: number }, camera: Camera3D): Raycaster {
+  ensureScratchMatrices();
+  const { origin, direction } = raycaster.ray;
+
+  const raw = camera.projectionMatrix.rawData;
+  const a0 = raw[0]; // -cot(fov/2) / aspect
+  const a5 = raw[5]; //  cot(fov/2)
+
+  _matrix.copy(camera.viewMatrix);
+  _matrix.rawData[12] = 0;
+  _matrix.rawData[13] = 0;
+  _matrix.rawData[14] = 0;
+  _matrix.invert();
+
+  direction.set(coords.x / a0, coords.y / a5, 1).transformDirection(_matrix);
+  origin.copy(camera.object3D.transform.worldPosition);
+  return raycaster;
 }
 
 /**
