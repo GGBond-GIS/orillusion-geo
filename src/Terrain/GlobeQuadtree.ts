@@ -10,6 +10,35 @@ const Intersect = { OUTSIDE: -1, INTERSECTING: 0, INSIDE: 1 } as const;
 /** 与 Cesium Visibility 一致的瓦片可见性。 */
 const Visibility = { NONE: 0, PARTIAL: 1, FULL: 2 } as const;
 
+/**
+ * 瓦片键的整数编码（消灭遍历热路径的字符串 key 分配，GC 压力源之一）：
+ * key = level * 2^36 + x * 2^18 + y。
+ * maximumLevel=17 时 x/y ≤ 2^17-1 < 2^18，level ≤ 17 < 2^5，level 段最大 17*2^36 ≈ 2^40.1 < 2^53，安全。
+ */
+const KEY_LEVEL_MULT = 0x4000000000; // 2^36
+const KEY_X_MULT = 0x40000;          // 2^18
+const KEY_COORD_MASK = 0x3ffff;      // 2^18 - 1
+
+/** level/x/y → 整数瓦片键。 */
+function keyOf(level: number, x: number, y: number): number {
+  return level * KEY_LEVEL_MULT + x * KEY_X_MULT + y;
+}
+
+/** 整数瓦片键 → level。 */
+function levelOf(key: number): number {
+  return Math.floor(key / KEY_LEVEL_MULT);
+}
+
+/** 整数瓦片键 → x。 */
+function xOf(key: number): number {
+  return Math.floor(key / KEY_X_MULT) & KEY_COORD_MASK;
+}
+
+/** 整数瓦片键 → y。 */
+function yOf(key: number): number {
+  return key & KEY_COORD_MASK;
+}
+
 /** 一个视锥平面：ax + by + cz + d = 0。 */
 interface FrustumPlane {
   x: number;
@@ -27,21 +56,21 @@ export interface TerrainHeightRange {
 /** Globe 提供的瓦片状态访问器，对应 Cesium QuadtreeTile / GlobeSurfaceTile 的只读面。 */
 export interface GlobeTileAccessor {
   /** 对齐 Cesium tile.renderable：地形网格与影像都就绪，本帧可真实绘制。 */
-  isFullyRenderable(tile: TerrainTileKey): boolean;
+  isFullyRenderable(key: number): boolean;
   /** Legacy Cesium selector hook retained for accessor compatibility. */
-  isCompletelyLoaded(tile: TerrainTileKey): boolean;
+  isCompletelyLoaded(key: number): boolean;
   /** Legacy Cesium selector hook retained for accessor compatibility. */
-  canRenderWithoutLosingDetail(tile: TerrainTileKey): boolean;
+  canRenderWithoutLosingDetail(key: number): boolean;
   /** 对齐 Cesium tile.needsLoading：该瓦片还需要加载。 */
-  needsLoading(tile: TerrainTileKey): boolean;
+  needsLoading(key: number): boolean;
   /** 对齐 Cesium surfaceTile.terrainData !== undefined。 */
-  hasTerrainData(tile: TerrainTileKey): boolean;
+  hasTerrainData(key: number): boolean;
   /** 对齐 Cesium tile.upsampledFromParent：地形上采样且影像全部失败。 */
-  isUpsampledFromParent(tile: TerrainTileKey): boolean;
+  isUpsampledFromParent(key: number): boolean;
   /** 对齐 Cesium tileBoundingRegion.boundingVolume：真实地形包围体，未就绪回退父级，再无则 undefined。 */
-  getBoundingVolume(tile: TerrainTileKey): BoundingSphere | undefined;
+  getBoundingVolume(key: number): BoundingSphere | undefined;
   /** Height interval from this tile when it already has a decoded terrain mesh. */
-  getHeightRange(tile: TerrainTileKey): TerrainHeightRange | undefined;
+  getHeightRange(key: number): TerrainHeightRange | undefined;
 }
 
 /** GlobeQuadtree 选择参数，对齐 Cesium QuadtreePrimitive / Globe / Scene.fog。 */
@@ -74,18 +103,18 @@ export interface GlobeQuadtreeOptions {
 
 /** 单帧遍历结果，对齐 Cesium _tilesToRender 与三级加载队列。 */
 export interface GlobeTraversalResult {
-  /** 本帧渲染列表（可能包含尚未就绪的瓦片，由 Globe 回退到最近可渲染祖先）。 */
-  renderList: TerrainTileKey[];
+  /** 本帧渲染列表（整数瓦片键，可能包含尚未就绪的瓦片，由 Globe 回退到最近可渲染祖先）。 */
+  renderList: number[];
   /** 高优先级加载队列：阻止细化的瓦片。 */
-  loadQueueHigh: TerrainTileKey[];
+  loadQueueHigh: number[];
   /** 中优先级加载队列：可渲染但需要加载、后代超限后提升的父瓦片、相机所在瓦片。 */
-  loadQueueMedium: TerrainTileKey[];
+  loadQueueMedium: number[];
   /** 低优先级加载队列：preloadAncestors / preloadSiblings。 */
-  loadQueueLow: TerrainTileKey[];
+  loadQueueLow: number[];
   /** 本帧访问过的所有瓦片键（含剔除），用于 replacement queue 保活。 */
-  touchedKeys: Set<string>;
+  touchedKeys: Set<number>;
   /** 相机所在、仅需加载地形的瓦片（CULLED_BUT_NEEDED）。 */
-  culledButNeededKeys: Set<string>;
+  culledButNeededKeys: Set<number>;
 }
 
 /**
@@ -93,7 +122,7 @@ export interface GlobeTraversalResult {
  * active 表示本帧 REPLACE 前沿，visible 表示 active 且资源已可绘制。
  */
 interface TraversalTileState {
-  key: string;
+  key: number;
   lastFrameVisited: number;
   used: boolean;
   usedLastFrame: boolean;
@@ -137,13 +166,13 @@ interface AccessorCacheEntry {
 interface TraversalContext {
   frameNumber: number;
   accessor: GlobeTileAccessor;
-  renderList: TerrainTileKey[];
-  loadQueueHigh: TerrainTileKey[];
-  loadQueueMedium: TerrainTileKey[];
-  loadQueueLow: TerrainTileKey[];
-  touchedKeys: Set<string>;
-  culledButNeededKeys: Set<string>;
-  queuedLoads: Set<string>;
+  renderList: number[];
+  loadQueueHigh: number[];
+  loadQueueMedium: number[];
+  loadQueueLow: number[];
+  touchedKeys: Set<number>;
+  culledButNeededKeys: Set<number>;
+  queuedLoads: Set<number>;
 }
 
 const scratchTileDirection = new Cartesian3();
@@ -194,8 +223,8 @@ export class GlobeQuadtree {
   /** 每帧遍历调试计数（诊断用）。 */
   public readonly debugCounts = { visited: 0, fog: 0, frustum: 0, horizon: 0, rendered: 0, refined: 0 };
 
-  private readonly states = new Map<string, TraversalTileState>();
-  private readonly accessorCache = new Map<string, AccessorCacheEntry>();
+  private readonly states = new Map<number, TraversalTileState>();
+  private readonly accessorCache = new Map<number, AccessorCacheEntry>();
   private readonly maximumCachedStates = 16_384;
   private cameraPosition = new Cartesian3();
   private cameraDirection = new Cartesian3();
@@ -240,9 +269,9 @@ export class GlobeQuadtree {
       loadQueueHigh: [],
       loadQueueMedium: [],
       loadQueueLow: [],
-      touchedKeys: new Set<string>(),
-      culledButNeededKeys: new Set<string>(),
-      queuedLoads: new Set<string>(),
+      touchedKeys: new Set<number>(),
+      culledButNeededKeys: new Set<number>(),
+      queuedLoads: new Set<number>(),
     };
     this.updateFrameContext();
     this.debugCounts.visited = 0;
@@ -288,7 +317,7 @@ export class GlobeQuadtree {
    * 查询某瓦片上一帧是否被渲染（RENDERED 或 RENDERED_AND_KICKED）。
    * 供 Globe 实现 canRenderWithoutLosingDetail 的后代检查使用。
    */
-  public wasRenderedLastFrame(key: string, frameNumber: number): boolean {
+  public wasRenderedLastFrame(key: number, frameNumber: number): boolean {
     const state = this.states.get(key);
     if (!state) return false;
     if (state.lastFrameVisited === frameNumber) return state.wasActive;
@@ -299,203 +328,88 @@ export class GlobeQuadtree {
    * 查询某瓦片上一帧是否被细化（REFINED 或 REFINED_AND_KICKED）。
    * 供 Globe 实现 canRenderWithoutLosingDetail 的后代遍历使用。
    */
-  public wasRefinedLastFrame(key: string, frameNumber: number): boolean {
+  public wasRefinedLastFrame(key: number, frameNumber: number): boolean {
     const state = this.states.get(key);
     if (!state) return false;
     if (state.lastFrameVisited === frameNumber) return state.wasRefined;
     return state.lastFrameVisited === frameNumber - 1 && state.refined;
   }
 
-  /** 生成内部瓦片键。 */
-  public tileKey(tile: TerrainTileKey): string {
-    return `${tile.level}/${tile.x}/${tile.y}`;
+  /** 取父瓦片键，根瓦片返回 -1。 */
+  public parentKeyOf(key: number): number {
+    const level = levelOf(key);
+    if (level === 0) return -1;
+    return keyOf(level - 1, Math.floor(xOf(key) / 2), Math.floor(yOf(key) / 2));
   }
 
-  /** 取父瓦片键，根瓦片返回 null。 */
-  public parentKey(key: string): string | null {
-    const [levelText, xText, yText] = key.split('/');
-    const level = Number(levelText);
-    if (level === 0) return null;
-    return `${level - 1}/${Math.floor(Number(xText) / 2)}/${Math.floor(Number(yText) / 2)}`;
+  /** 整数瓦片键 → 坐标（供 Globe 等消费遍历结果）。 */
+  public decodeKey(key: number): TerrainTileKey {
+    return { level: levelOf(key), x: xOf(key), y: yOf(key) };
+  }
+
+  /** level/x/y → 整数瓦片键（供 Globe 等生成遍历键）。 */
+  public keyOf(level: number, x: number, y: number): number {
+    return keyOf(level, x, y);
   }
 
   /** 供 Globe 在瓦片被淘汰时清理四叉树缓存。 */
-  public invalidate(key: string): void {
+  public invalidate(key: number): void {
     this.states.delete(key);
     this.accessorCache.delete(key);
   }
 
-  /** 对齐 Cesium QuadtreePrimitive.visitTile。 */
-  /* Legacy Cesium traversal retained in git history; replaced below.
-  private visitTile(tile: TerrainTileKey, ancestorMeetsSse: boolean, details: TraversalDetails, ctx: TraversalContext): void {
-    const key = this.tileKey(tile);
-    const state = this.ensureState(tile);
-    ctx.touchedKeys.add(key);
-    this.debugCounts.visited += 1;
-
-    const meetsSse = this.screenSpaceError(tile, state) < this.maximumScreenSpaceError;
-    const lastFrameResult = state.resultFrame === ctx.frameNumber - 1 ? state.result : SelectionResult.NONE;
-    const cachedAccessor = this.accessorOf(tile, ctx);
-
-    if (meetsSse || ancestorMeetsSse) {
-      // 该瓦片（或其祖先）是本帧想渲染的。是否真正渲染取决于：
-      // 1. 上一帧渲染过（或被 KICK）；2. 上一帧被剔除或未访问；3. 完全加载完成；4. 渲染它不会丢失细节。
-      const oneRenderedLastFrame = originalResult(lastFrameResult) === SelectionResult.RENDERED;
-      const twoCulledOrNotVisited =
-        originalResult(lastFrameResult) === SelectionResult.CULLED ||
-        lastFrameResult === SelectionResult.NONE;
-      const threeCompletelyLoaded = cachedAccessor.completelyLoaded;
-      let renderable = oneRenderedLastFrame || twoCulledOrNotVisited || threeCompletelyLoaded;
-      if (!renderable) {
-        renderable = cachedAccessor.canRender;
-      }
-
-      if (renderable) {
-        // 只有该瓦片（而非其祖先）满足 SSE 时才加载它。
-        if (meetsSse) {
-          this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
-        }
-        this.addTileToRenderList(ctx, tile);
-        details.allAreRenderable = cachedAccessor.fullyRenderable;
-        details.anyWereRenderedLastFrame = lastFrameResult === SelectionResult.RENDERED;
-        details.notYetRenderableCount = cachedAccessor.fullyRenderable ? 0 : 1;
-        state.result = SelectionResult.RENDERED;
-        state.resultFrame = ctx.frameNumber;
-        return;
-      }
-
-      // 否则不能渲染本瓦片（会丢失上一帧可见的细节）：
-      // 继续遍历后代，保持上一帧渲染的后代继续渲染，并为新出现的后代渲染“填充”。
-      ancestorMeetsSse = true;
-      if (meetsSse) {
-        this.queueTileLoad(ctx, ctx.loadQueueHigh, tile, state);
-      }
-    }
-
-    if (this.canRefine(tile, ctx)) {
-      // 对齐 Cesium：四个子瓦片全部参与 allAreUpsampled 判断与 near-to-far 访问，
-      // 可见性测试在 visitIfVisible 内部完成。
-      const childLevel = tile.level + 1;
-      const childX = tile.x * 2;
-      const childY = tile.y * 2;
-      const children: TerrainTileKey[] = [
-        { x: childX, y: childY, level: childLevel },
-        { x: childX + 1, y: childY, level: childLevel },
-        { x: childX, y: childY + 1, level: childLevel },
-        { x: childX + 1, y: childY + 1, level: childLevel },
-      ];
-      const allAreUpsampled = children.every(child => this.accessorOf(child, ctx).upsampled);
-
-      if (allAreUpsampled) {
-        // 四个子瓦片都只是父级上采样，渲染它们没有意义：渲染本瓦片。
-        this.addTileToRenderList(ctx, tile);
-        this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
-        // 保活子瓦片，避免它们被卸载后忘记自己是 upsampled。
-        for (const child of children) ctx.touchedKeys.add(this.tileKey(child));
-        details.allAreRenderable = cachedAccessor.fullyRenderable;
-        details.anyWereRenderedLastFrame = lastFrameResult === SelectionResult.RENDERED;
-        details.notYetRenderableCount = cachedAccessor.fullyRenderable ? 0 : 1;
-        state.result = SelectionResult.RENDERED;
-        state.resultFrame = ctx.frameNumber;
-        return;
-      }
-
-      // SSE 不满足，细化。
-      state.result = SelectionResult.REFINED;
-      state.resultFrame = ctx.frameNumber;
-
-      const firstRenderedDescendantIndex = ctx.renderList.length;
-      const loadIndexLow = ctx.loadQueueLow.length;
-      const loadIndexMedium = ctx.loadQueueMedium.length;
-      const loadIndexHigh = ctx.loadQueueHigh.length;
-
-      this.visitVisibleChildrenNearToFar(children, ctx, ancestorMeetsSse, details);
-
-      if (firstRenderedDescendantIndex !== ctx.renderList.length) {
-        const allAreRenderable = details.allAreRenderable;
-        const anyWereRenderedLastFrame = details.anyWereRenderedLastFrame;
-        const notYetRenderableCount = details.notYetRenderableCount;
-        let queuedForLoad = false;
-
-        if (!allAreRenderable && !anyWereRenderedLastFrame) {
-          // 后代还没有全部就绪且上一帧没有渲染它们：把后代踢出渲染列表，改渲染本瓦片。
-          // 被踢的后代及其中间祖先标记为 KICKED，下一帧仍按“上一帧渲染过”处理，保持细节。
-          for (let index = firstRenderedDescendantIndex; index < ctx.renderList.length; index += 1) {
-            let workKey: string | null = this.tileKey(ctx.renderList[index]);
-            while (workKey !== null && !wasKicked(this.states.get(workKey)?.result ?? SelectionResult.NONE) && workKey !== key) {
-              const workState = this.states.get(workKey);
-              if (workState) workState.result = kick(workState.result);
-              workKey = this.parentKey(workKey);
-            }
-          }
-          ctx.renderList.length = firstRenderedDescendantIndex;
-          this.addTileToRenderList(ctx, tile);
-          state.result = SelectionResult.RENDERED;
-          state.resultFrame = ctx.frameNumber;
-
-          const wasRenderedLastFrame = lastFrameResult === SelectionResult.RENDERED;
-          if (!wasRenderedLastFrame && notYetRenderableCount > this.loadingDescendantLimit) {
-            // 等待的后代太多：放弃加载后代，改为加载本瓦片（medium 优先级），直到本瓦片可渲染。
-            ctx.loadQueueLow.length = loadIndexLow;
-            ctx.loadQueueMedium.length = loadIndexMedium;
-            ctx.loadQueueHigh.length = loadIndexHigh;
-            this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
-            details.notYetRenderableCount = cachedAccessor.fullyRenderable ? 0 : 1;
-            queuedForLoad = true;
-          }
-
-          details.allAreRenderable = cachedAccessor.fullyRenderable;
-          details.anyWereRenderedLastFrame = wasRenderedLastFrame;
-        }
-
-        if (this.preloadAncestors && !queuedForLoad) {
-          this.queueTileLoad(ctx, ctx.loadQueueLow, tile, state);
-        }
-      }
-      return;
-    }
-
-    // 无法细化（没有子瓦片可用性数据）：本瓦片是细化阻塞者，渲染并高优先级加载。
-    state.result = SelectionResult.RENDERED;
-    state.resultFrame = ctx.frameNumber;
-    this.addTileToRenderList(ctx, tile);
-    this.queueTileLoad(ctx, ctx.loadQueueHigh, tile, state);
-    details.allAreRenderable = cachedAccessor.fullyRenderable;
-    details.anyWereRenderedLastFrame = lastFrameResult === SelectionResult.RENDERED;
-    details.notYetRenderableCount = cachedAccessor.fullyRenderable ? 0 : 1;
-  }
-
-  */
-
   /** 3d-tiles-renderer markUsedTiles：按视锥与 SSE 构建本帧 used 子树。 */
-  private markUsedTiles(tile: TerrainTileKey, ctx: TraversalContext): void {
-    const state = this.resetFrameState(tile, ctx);
+  private markUsedTiles(key: number, ctx: TraversalContext): void {
+    const state = this.resetFrameState(key, ctx);
     if (!state.inFrustum) {
-      if (this.containsNeededPosition(tile) && this.accessorOf(tile, ctx).needsLoading) {
+      if (this.containsNeededPosition(key) && this.accessorOf(key, ctx).needsLoading) {
         ctx.culledButNeededKeys.add(state.key);
-        this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
+        this.queueTileLoad(ctx, ctx.loadQueueMedium, key, state);
       }
       return;
     }
 
-    if (!this.canTraverse(tile, state, ctx)) {
+    if (!this.canTraverse(key, state, ctx)) {
       state.used = true;
       return;
     }
 
-    const children = this.childrenOf(tile);
+    // 四个子瓦片内联展开（避免每瓦片分配 children 数组与 4 个坐标对象）。
+    const level = levelOf(key);
+    const x = xOf(key);
+    const y = yOf(key);
+    const childLevel = level + 1;
+    const childX = x * 2;
+    const childY = y * 2;
+    const c0 = keyOf(childLevel, childX, childY);
+    const c1 = keyOf(childLevel, childX + 1, childY);
+    const c2 = keyOf(childLevel, childX, childY + 1);
+    const c3 = keyOf(childLevel, childX + 1, childY + 1);
     let anyChildrenUsed = false;
     let anyChildrenInFrustum = false;
-    for (const child of children) {
-      this.markUsedTiles(child, ctx);
-      const childState = this.ensureState(child);
-      anyChildrenUsed ||= childState.lastFrameVisited === ctx.frameNumber && childState.used;
-      anyChildrenInFrustum ||= childState.lastFrameVisited === ctx.frameNumber && childState.inFrustum;
-    }
+    this.markUsedTiles(c0, ctx);
+    let childState = this.ensureState(c0);
+    anyChildrenUsed ||= childState.lastFrameVisited === ctx.frameNumber && childState.used;
+    anyChildrenInFrustum ||= childState.lastFrameVisited === ctx.frameNumber && childState.inFrustum;
+    this.markUsedTiles(c1, ctx);
+    childState = this.ensureState(c1);
+    anyChildrenUsed ||= childState.lastFrameVisited === ctx.frameNumber && childState.used;
+    anyChildrenInFrustum ||= childState.lastFrameVisited === ctx.frameNumber && childState.inFrustum;
+    this.markUsedTiles(c2, ctx);
+    childState = this.ensureState(c2);
+    anyChildrenUsed ||= childState.lastFrameVisited === ctx.frameNumber && childState.used;
+    anyChildrenInFrustum ||= childState.lastFrameVisited === ctx.frameNumber && childState.inFrustum;
+    this.markUsedTiles(c3, ctx);
+    childState = this.ensureState(c3);
+    anyChildrenUsed ||= childState.lastFrameVisited === ctx.frameNumber && childState.used;
+    anyChildrenInFrustum ||= childState.lastFrameVisited === ctx.frameNumber && childState.inFrustum;
 
     if (!anyChildrenInFrustum) {
       state.inFrustum = false;
-      for (const child of children) ctx.touchedKeys.add(this.tileKey(child));
+      ctx.touchedKeys.add(c0);
+      ctx.touchedKeys.add(c1);
+      ctx.touchedKeys.add(c2);
+      ctx.touchedKeys.add(c3);
       return;
     }
 
@@ -506,46 +420,81 @@ export class GlobeQuadtree {
       // Match 3d-tiles-renderer exactly: loadAncestors implicitly enables the four siblings.
       // This prevents a newly visible sibling from forcing its whole parent active for 1-2
       // frames during lateral camera movement. Tile-local synthetic bounds keep this bounded.
-      for (const child of children) this.recursivelyMarkUsed(child, ctx);
+      this.recursivelyMarkUsed(c0, ctx);
+      this.recursivelyMarkUsed(c1, ctx);
+      this.recursivelyMarkUsed(c2, ctx);
+      this.recursivelyMarkUsed(c3, ctx);
     }
   }
 
   /** Mark a sibling fallback tile as used without forcing deeper refinement. */
-  private recursivelyMarkUsed(tile: TerrainTileKey, ctx: TraversalContext): void {
-    this.resetFrameState(tile, ctx).used = true;
+  private recursivelyMarkUsed(key: number, ctx: TraversalContext): void {
+    this.resetFrameState(key, ctx).used = true;
   }
 
   /** 3d-tiles-renderer markUsedSetLeaves：自底向上计算叶节点和子内容就绪状态。 */
-  private markUsedSetLeaves(tile: TerrainTileKey, ctx: TraversalContext): void {
-    const state = this.ensureState(tile);
+  private markUsedSetLeaves(key: number, ctx: TraversalContext): void {
+    const state = this.ensureState(key);
     if (state.lastFrameVisited !== ctx.frameNumber || !state.used) return;
 
-    const usedChildren = this.childrenOf(tile).filter(child => {
-      const childState = this.ensureState(child);
-      return childState.lastFrameVisited === ctx.frameNumber && childState.used;
-    });
-    if (usedChildren.length === 0) {
+    const level = levelOf(key);
+    const x = xOf(key);
+    const y = yOf(key);
+    const childLevel = level + 1;
+    const childX = x * 2;
+    const childY = y * 2;
+    const c0 = keyOf(childLevel, childX, childY);
+    const c1 = keyOf(childLevel, childX + 1, childY);
+    const c2 = keyOf(childLevel, childX, childY + 1);
+    const c3 = keyOf(childLevel, childX + 1, childY + 1);
+    const s0 = this.ensureState(c0);
+    const s1 = this.ensureState(c1);
+    const s2 = this.ensureState(c2);
+    const s3 = this.ensureState(c3);
+    const used0 = s0.lastFrameVisited === ctx.frameNumber && s0.used;
+    const used1 = s1.lastFrameVisited === ctx.frameNumber && s1.used;
+    const used2 = s2.lastFrameVisited === ctx.frameNumber && s2.used;
+    const used3 = s3.lastFrameVisited === ctx.frameNumber && s3.used;
+    if (!used0 && !used1 && !used2 && !used3) {
       state.isLeaf = true;
       return;
     }
 
     let allChildrenLoaded = true;
-    for (const child of usedChildren) {
-      this.markUsedSetLeaves(child, ctx);
-      const childState = this.ensureState(child);
+    if (used0) {
+      this.markUsedSetLeaves(c0, ctx);
       // loadAncestors marks all four siblings as used for prefetching. Unlike a 3D Tiles content
       // tree, globe siblings can cover a large off-screen or polar region whose imagery may never
       // become renderable. Keep preloading it, but do not let it gate replacement of the visible
       // part of this parent.
-      if (!childState.inFrustum) continue;
-      allChildrenLoaded &&= this.accessorOf(child, ctx).fullyRenderable || childState.allChildrenLoaded;
+      if (this.ensureState(c0).inFrustum) {
+        allChildrenLoaded &&= this.accessorOf(c0, ctx).fullyRenderable || this.ensureState(c0).allChildrenLoaded;
+      }
+    }
+    if (used1) {
+      this.markUsedSetLeaves(c1, ctx);
+      if (this.ensureState(c1).inFrustum) {
+        allChildrenLoaded &&= this.accessorOf(c1, ctx).fullyRenderable || this.ensureState(c1).allChildrenLoaded;
+      }
+    }
+    if (used2) {
+      this.markUsedSetLeaves(c2, ctx);
+      if (this.ensureState(c2).inFrustum) {
+        allChildrenLoaded &&= this.accessorOf(c2, ctx).fullyRenderable || this.ensureState(c2).allChildrenLoaded;
+      }
+    }
+    if (used3) {
+      this.markUsedSetLeaves(c3, ctx);
+      if (this.ensureState(c3).inFrustum) {
+        allChildrenLoaded &&= this.accessorOf(c3, ctx).fullyRenderable || this.ensureState(c3).allChildrenLoaded;
+      }
     }
     state.allChildrenLoaded = allChildrenLoaded;
   }
 
   /** 3d-tiles-renderer markVisibleTiles：REPLACE 父级保持 active，直到全部 used 子级可显示。 */
-  private markVisibleTiles(tile: TerrainTileKey, ctx: TraversalContext): void {
-    const state = this.ensureState(tile);
+  private markVisibleTiles(key: number, ctx: TraversalContext): void {
+    const state = this.ensureState(key);
     if (state.lastFrameVisited !== ctx.frameNumber || !state.used) return;
 
     // loadAncestors may hold a parent while its first child frontier is loading. Once this
@@ -560,61 +509,141 @@ export class GlobeQuadtree {
       return;
     }
 
+    const level = levelOf(key);
+    const x = xOf(key);
+    const y = yOf(key);
+    const childLevel = level + 1;
+    const childX = x * 2;
+    const childY = y * 2;
+    const c0 = keyOf(childLevel, childX, childY);
+    const c1 = keyOf(childLevel, childX + 1, childY);
+    const c2 = keyOf(childLevel, childX, childY + 1);
+    const c3 = keyOf(childLevel, childX + 1, childY + 1);
     let allChildrenReady = true;
-    for (const child of this.childrenOf(tile)) {
-      const childState = this.ensureState(child);
-      if (childState.lastFrameVisited !== ctx.frameNumber || !childState.used) continue;
-      this.markVisibleTiles(child, ctx);
-      if (!childState.inFrustum) continue;
-      const childReady = childState.active && this.accessorOf(child, ctx).fullyRenderable;
-      if (!childReady && !childState.allChildrenReady) allChildrenReady = false;
+    let childState = this.ensureState(c0);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      this.markVisibleTiles(c0, ctx);
+      childState = this.ensureState(c0);
+      if (childState.inFrustum) {
+        const childReady = childState.active && this.accessorOf(c0, ctx).fullyRenderable;
+        if (!childReady && !childState.allChildrenReady) allChildrenReady = false;
+      }
+    }
+    childState = this.ensureState(c1);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      this.markVisibleTiles(c1, ctx);
+      childState = this.ensureState(c1);
+      if (childState.inFrustum) {
+        const childReady = childState.active && this.accessorOf(c1, ctx).fullyRenderable;
+        if (!childReady && !childState.allChildrenReady) allChildrenReady = false;
+      }
+    }
+    childState = this.ensureState(c2);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      this.markVisibleTiles(c2, ctx);
+      childState = this.ensureState(c2);
+      if (childState.inFrustum) {
+        const childReady = childState.active && this.accessorOf(c2, ctx).fullyRenderable;
+        if (!childReady && !childState.allChildrenReady) allChildrenReady = false;
+      }
+    }
+    childState = this.ensureState(c3);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      this.markVisibleTiles(c3, ctx);
+      childState = this.ensureState(c3);
+      if (childState.inFrustum) {
+        const childReady = childState.active && this.accessorOf(c3, ctx).fullyRenderable;
+        if (!childReady && !childState.allChildrenReady) allChildrenReady = false;
+      }
     }
     state.allChildrenReady = allChildrenReady;
 
-    if (!allChildrenReady && state.wasActive && this.accessorOf(tile, ctx).fullyRenderable) {
+    if (!allChildrenReady && state.wasActive && this.accessorOf(key, ctx).fullyRenderable) {
       state.active = true;
-      this.kickActiveChildren(tile, ctx);
+      this.kickActiveChildren(key, ctx);
     }
   }
 
   /** Keep descendants loaded while removing them from the REPLACE display frontier. */
-  private kickActiveChildren(tile: TerrainTileKey, ctx: TraversalContext): void {
-    for (const child of this.childrenOf(tile)) {
-      const state = this.ensureState(child);
-      if (state.lastFrameVisited !== ctx.frameNumber || !state.used) continue;
-      if (state.active) {
-        state.active = false;
-        state.kicked = true;
+  private kickActiveChildren(key: number, ctx: TraversalContext): void {
+    const level = levelOf(key);
+    const x = xOf(key);
+    const y = yOf(key);
+    const childLevel = level + 1;
+    const childX = x * 2;
+    const childY = y * 2;
+    const c0 = keyOf(childLevel, childX, childY);
+    const c1 = keyOf(childLevel, childX + 1, childY);
+    const c2 = keyOf(childLevel, childX, childY + 1);
+    const c3 = keyOf(childLevel, childX + 1, childY + 1);
+    let childState = this.ensureState(c0);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      if (childState.active) {
+        childState.active = false;
+        childState.kicked = true;
       }
-      this.kickActiveChildren(child, ctx);
+      this.kickActiveChildren(c0, ctx);
+    }
+    childState = this.ensureState(c1);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      if (childState.active) {
+        childState.active = false;
+        childState.kicked = true;
+      }
+      this.kickActiveChildren(c1, ctx);
+    }
+    childState = this.ensureState(c2);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      if (childState.active) {
+        childState.active = false;
+        childState.kicked = true;
+      }
+      this.kickActiveChildren(c2, ctx);
+    }
+    childState = this.ensureState(c3);
+    if (childState.lastFrameVisited === ctx.frameNumber && childState.used) {
+      if (childState.active) {
+        childState.active = false;
+        childState.kicked = true;
+      }
+      this.kickActiveChildren(c3, ctx);
     }
   }
 
   /** 3d-tiles-renderer toggleTiles 的无渲染器适配：生成 renderList 与加载优先级。 */
-  private collectTiles(tile: TerrainTileKey, ctx: TraversalContext): void {
-    const state = this.ensureState(tile);
+  private collectTiles(key: number, ctx: TraversalContext): void {
+    const state = this.ensureState(key);
     if (state.lastFrameVisited !== ctx.frameNumber || !state.used) return;
 
     ctx.touchedKeys.add(state.key);
-    const accessor = this.accessorOf(tile, ctx);
+    const accessor = this.accessorOf(key, ctx);
     const activeInFrustum = state.active && state.inFrustum;
     state.visible = activeInFrustum && accessor.fullyRenderable;
     // Keep unloaded active leaves in the selected frontier. Globe.applySelection resolves
     // them to the nearest renderable ancestor, so a pending mesh/material cannot expose the
     // clear color as a rectangular hole.
-    if (activeInFrustum) this.addTileToRenderList(ctx, tile);
+    if (activeInFrustum) this.addTileToRenderList(ctx, key);
 
     if (accessor.needsLoading) {
-      if (state.active || state.kicked) this.queueTileLoad(ctx, ctx.loadQueueHigh, tile, state);
-      else if (state.inFrustum) this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
-      else this.queueTileLoad(ctx, ctx.loadQueueLow, tile, state);
+      if (state.active || state.kicked) this.queueTileLoad(ctx, ctx.loadQueueHigh, key, state);
+      else if (state.inFrustum) this.queueTileLoad(ctx, ctx.loadQueueMedium, key, state);
+      else this.queueTileLoad(ctx, ctx.loadQueueLow, key, state);
     }
-    for (const child of this.childrenOf(tile)) this.collectTiles(child, ctx);
+    const level = levelOf(key);
+    const x = xOf(key);
+    const y = yOf(key);
+    const childLevel = level + 1;
+    const childX = x * 2;
+    const childY = y * 2;
+    this.collectTiles(keyOf(childLevel, childX, childY), ctx);
+    this.collectTiles(keyOf(childLevel, childX + 1, childY), ctx);
+    this.collectTiles(keyOf(childLevel, childX, childY + 1), ctx);
+    this.collectTiles(keyOf(childLevel, childX + 1, childY + 1), ctx);
   }
 
   /** Reset persistent traversal state exactly once per frame and calculate view error. */
-  private resetFrameState(tile: TerrainTileKey, ctx: TraversalContext): TraversalTileState {
-    const state = this.ensureState(tile);
+  private resetFrameState(key: number, ctx: TraversalContext): TraversalTileState {
+    const state = this.ensureState(key);
     if (state.lastFrameVisited === ctx.frameNumber) return state;
     state.wasActive = state.active;
     state.wasVisible = state.visible;
@@ -624,39 +653,27 @@ export class GlobeQuadtree {
     state.used = false;
     state.active = false;
     state.visible = false;
-    state.inFrustum = this.computeTileVisibility(tile, ctx) !== Visibility.NONE;
+    state.inFrustum = this.computeTileVisibility(key, ctx) !== Visibility.NONE;
     state.isLeaf = false;
     state.refined = false;
     state.allChildrenReady = false;
     state.allChildrenLoaded = false;
     state.kicked = false;
-    state.error = this.screenSpaceError(tile, state);
+    state.error = this.screenSpaceError(levelOf(key), state);
     ctx.touchedKeys.add(state.key);
     this.debugCounts.visited += 1;
     return state;
   }
 
-  private canTraverse(tile: TerrainTileKey, state: TraversalTileState, ctx: TraversalContext): boolean {
-    return state.error > this.maximumScreenSpaceError && this.canRefine(tile, ctx);
-  }
-
-  private childrenOf(tile: TerrainTileKey): TerrainTileKey[] {
-    const level = tile.level + 1;
-    const x = tile.x * 2;
-    const y = tile.y * 2;
-    return [
-      { x, y, level },
-      { x: x + 1, y, level },
-      { x, y: y + 1, level },
-      { x: x + 1, y: y + 1, level },
-    ];
+  private canTraverse(key: number, state: TraversalTileState, ctx: TraversalContext): boolean {
+    return state.error > this.maximumScreenSpaceError && this.canRefine(key, ctx);
   }
 
   /** 取得或计算瓦片矩形（缓存于瓦片状态，避免每帧多次分配 Cesium Rectangle）。 */
-  private rectangleOf(tile: TerrainTileKey): Rectangle {
-    const state = this.ensureState(tile);
+  private rectangleOf(key: number): Rectangle {
+    const state = this.ensureState(key);
     if (!state.rectangle) {
-      state.rectangle = this.tilingScheme.tileXYToRectangle(tile.x, tile.y, tile.level);
+      state.rectangle = this.tilingScheme.tileXYToRectangle(xOf(key), yOf(key), levelOf(key));
     }
     return state.rectangle;
   }
@@ -664,19 +681,19 @@ export class GlobeQuadtree {
   /**
    * 取得或创建瓦片本帧的 accessor 结果缓存（每帧每瓦片只计算一次）。
    */
-  private accessorOf(tile: TerrainTileKey, ctx: TraversalContext): AccessorCacheEntry {
-    const key = this.tileKey(tile);
+  private accessorOf(key: number, ctx: TraversalContext): AccessorCacheEntry {
     const cached = this.accessorCache.get(key);
     if (cached && cached.frame === ctx.frameNumber) {
       return cached;
     }
-    const ownHeightRange = ctx.accessor.getHeightRange(tile);
-    const inheritedHeightRange = ownHeightRange ?? (tile.level > 0
-      ? this.accessorOf({ x: Math.floor(tile.x / 2), y: Math.floor(tile.y / 2), level: tile.level - 1 }, ctx).heightRange
+    const level = levelOf(key);
+    const ownHeightRange = ctx.accessor.getHeightRange(key);
+    const inheritedHeightRange = ownHeightRange ?? (level > 0
+      ? this.accessorOf(keyOf(level - 1, Math.floor(xOf(key) / 2), Math.floor(yOf(key) / 2)), ctx).heightRange
       : undefined);
-    const state = this.ensureState(tile);
-    const volume = ctx.accessor.getBoundingVolume(tile) ?? this.createConservativeBoundingVolume(
-      tile,
+    const state = this.ensureState(key);
+    const volume = ctx.accessor.getBoundingVolume(key) ?? this.createConservativeBoundingVolume(
+      key,
       inheritedHeightRange,
       state,
     );
@@ -690,10 +707,10 @@ export class GlobeQuadtree {
       volume: undefined,
     };
     entry.frame = ctx.frameNumber;
-    entry.fullyRenderable = ctx.accessor.isFullyRenderable(tile);
-    entry.needsLoading = ctx.accessor.needsLoading(tile);
-    entry.hasTerrainData = ctx.accessor.hasTerrainData(tile);
-    entry.upsampled = ctx.accessor.isUpsampledFromParent(tile);
+    entry.fullyRenderable = ctx.accessor.isFullyRenderable(key);
+    entry.needsLoading = ctx.accessor.needsLoading(key);
+    entry.hasTerrainData = ctx.accessor.hasTerrainData(key);
+    entry.upsampled = ctx.accessor.isUpsampledFromParent(key);
     entry.heightRange = inheritedHeightRange;
     entry.volume = volume;
     if (!cached) this.accessorCache.set(key, entry);
@@ -702,11 +719,11 @@ export class GlobeQuadtree {
 
   /** Build a local pre-load volume without inheriting the ancestor's much wider footprint. */
   private createConservativeBoundingVolume(
-    tile: TerrainTileKey,
+    key: number,
     range: TerrainHeightRange | undefined,
     state: TraversalTileState,
   ): BoundingSphere {
-    const geometricError = this.terrainProvider.getLevelMaximumGeometricError(tile.level);
+    const geometricError = this.terrainProvider.getLevelMaximumGeometricError(levelOf(key));
     // TerrainMesh min/max describe the full ancestor tile, so every descendant is already
     // enclosed by that interval. Expanding it again by each level's geometric error makes
     // grazing-angle volumes unnecessarily large and causes traversal/load fan-out.
@@ -719,7 +736,7 @@ export class GlobeQuadtree {
     ) {
       return state.syntheticVolume;
     }
-    const rectangle = this.rectangleOf(tile);
+    const rectangle = this.rectangleOf(key);
     const ellipsoid = this.tilingScheme.ellipsoid;
     const positions = Rectangle.subsample(rectangle, ellipsoid, minimumHeight);
     const upperPositions = Rectangle.subsample(rectangle, ellipsoid, maximumHeight);
@@ -730,86 +747,16 @@ export class GlobeQuadtree {
     return state.syntheticVolume;
   }
 
-  /** 对齐 Cesium visitVisibleChildrenNearToFar：按相机所在象限 near-to-far 访问四个子瓦片。 */
-  /* Legacy Cesium child visitation replaced by markUsedTiles.
-  private visitVisibleChildrenNearToFar(
-    children: TerrainTileKey[],
-    ctx: TraversalContext,
-    ancestorMeetsSse: boolean,
-    details: TraversalDetails,
-  ): void {
-    // children 顺序固定为 [southwest, southeast, northwest, northeast]。
-    const southwest = children[0];
-    const rectangle = this.rectangleOf(southwest);
-    let order: number[];
-    if (this.cameraCartographic.longitude < rectangle.east) {
-      if (this.cameraCartographic.latitude < rectangle.north) {
-        order = [0, 1, 2, 3]; // 相机在西南象限
-      } else {
-        order = [2, 0, 3, 1]; // 西北
-      }
-    } else if (this.cameraCartographic.latitude < rectangle.north) {
-      order = [1, 0, 3, 2]; // 东南
-    } else {
-      order = [3, 2, 1, 0]; // 东北
-    }
-
-    const quadDetails: TraversalDetails[] = this.acquireDetails(4);
-    for (let index = 0; index < order.length; index += 1) {
-      this.visitIfVisible(children[order[index]], ctx, ancestorMeetsSse, quadDetails[index]);
-    }
-    const combined = TraversalDetails.combine(quadDetails);
-    this.releaseDetails(quadDetails);
-    details.allAreRenderable = combined.allAreRenderable;
-    details.anyWereRenderedLastFrame = combined.anyWereRenderedLastFrame;
-    details.notYetRenderableCount = combined.notYetRenderableCount;
-  }
-
-  */
-  /** 对齐 Cesium visitIfVisible。 */
-  /* Legacy Cesium child visitation replaced by markUsedTiles.
-  private visitIfVisible(tile: TerrainTileKey, ctx: TraversalContext, ancestorMeetsSse: boolean, details: TraversalDetails): void {
-    if (this.computeTileVisibility(tile, ctx) !== Visibility.NONE) {
-      this.visitTile(tile, ancestorMeetsSse, details, ctx);
-      return;
-    }
-
-    const key = this.tileKey(tile);
-    ctx.touchedKeys.add(key);
-    const state = this.ensureState(tile);
-    details.allAreRenderable = true;
-    details.anyWereRenderedLastFrame = false;
-    details.notYetRenderableCount = 0;
-
-    if (this.containsNeededPosition(tile)) {
-      // 相机位置所在瓦片：只加载地形（medium 优先级），对相机高度/参考系有影响。
-      if (this.accessorOf(tile, ctx).needsLoading) {
-        this.queueTileLoad(ctx, ctx.loadQueueMedium, tile, state);
-      }
-      state.result = SelectionResult.CULLED_BUT_NEEDED;
-      ctx.culledButNeededKeys.add(key);
-    } else if (this.preloadSiblings || tile.level === 0) {
-      // 剔除的 level zero 瓦片与 preloadSiblings 瓦片低优先级加载。
-      this.queueTileLoad(ctx, ctx.loadQueueLow, tile, state);
-      state.result = SelectionResult.CULLED;
-    } else {
-      state.result = SelectionResult.CULLED;
-    }
-    state.resultFrame = ctx.frameNumber;
-  }
-
-  */
-
   /**
    * 对齐 Cesium GlobeSurfaceTileProvider.computeTileVisibility：
    * 雾剔除 → 视锥剔除 → 椭球地平线剔除；并缓存本帧瓦片距离。
    */
-  private computeTileVisibility(tile: TerrainTileKey, ctx: TraversalContext): number {
-    const state = this.ensureState(tile);
+  private computeTileVisibility(key: number, ctx: TraversalContext): number {
+    const state = this.ensureState(key);
     // 对齐 Cesium computeDistanceToTile：包围体来自本瓦片或祖先地形（含高度）；
     // 完全找不到高度数据时使用 9999999999 哨兵距离——SSE 趋近于 0（加载并渲染而不细化），
     // 且会被雾剔除，避免没有包围体时无限细化。
-    const cachedAccessor = this.accessorOf(tile, ctx);
+    const cachedAccessor = this.accessorOf(key, ctx);
     state.distance = cachedAccessor.volume
       ? Math.max(0, Cartesian3.distance(this.cameraPosition, cachedAccessor.volume.center) - cachedAccessor.volume.radius)
       : 9_999_999_999.0;
@@ -844,7 +791,7 @@ export class GlobeQuadtree {
     }
 
     // 椭球地平线剔除。
-    if (!this.isVisibleFromCamera(tile)) {
+    if (!this.isVisibleFromCamera(key)) {
       this.debugCounts.horizon += 1;
       return Visibility.NONE;
     }
@@ -859,32 +806,34 @@ export class GlobeQuadtree {
    * 此时 **不允许** 细化到未加载的层级——遍历深度被已加载层级约束，
    * 这正是 Cesium 从太空看椭球地形时不会一次性下钻到 SSE 叶层级的关键限制。
    */
-  private canRefine(tile: TerrainTileKey, ctx: TraversalContext): boolean {
-    if (tile.level >= this.maximumLevel) {
+  private canRefine(key: number, ctx: TraversalContext): boolean {
+    const level = levelOf(key);
+    if (level >= this.maximumLevel) {
       return false;
     }
-    if (this.accessorOf(tile, ctx).hasTerrainData) {
+    if (this.accessorOf(key, ctx).hasTerrainData) {
       return true;
     }
-    const child = { x: tile.x * 2, y: tile.y * 2, level: tile.level + 1 };
+    const childX = xOf(key) * 2;
+    const childY = yOf(key) * 2;
     const childAvailable = (this.terrainProvider as { getTileDataAvailable?(x: number, y: number, level: number): boolean | undefined })
-      .getTileDataAvailable?.(child.x, child.y, child.level);
+      .getTileDataAvailable?.(childX, childY, level + 1);
     return childAvailable !== undefined;
   }
 
   /** 对齐 Cesium QuadtreePrimitive.queueTileLoad：只入队需要加载的瓦片并计算优先级。 */
-  private queueTileLoad(ctx: TraversalContext, queue: TerrainTileKey[], tile: TerrainTileKey, state: TraversalTileState): void {
-    if (!this.accessorOf(tile, ctx).needsLoading || ctx.queuedLoads.has(state.key)) {
+  private queueTileLoad(ctx: TraversalContext, queue: number[], key: number, state: TraversalTileState): void {
+    if (!this.accessorOf(key, ctx).needsLoading || ctx.queuedLoads.has(state.key)) {
       return;
     }
     ctx.queuedLoads.add(state.key);
-    state.priority = this.computeTileLoadPriority(tile, state, ctx);
-    queue.push(tile);
+    state.priority = this.computeTileLoadPriority(key, state, ctx);
+    queue.push(key);
   }
 
   /** 对齐 Cesium GlobeSurfaceTileProvider.computeTileLoadPriority：(1 - dot(tileDir, cameraDir)) * distance。 */
-  private computeTileLoadPriority(tile: TerrainTileKey, state: TraversalTileState, ctx: TraversalContext): number {
-    const sphere = this.accessorOf(tile, ctx).volume;
+  private computeTileLoadPriority(key: number, state: TraversalTileState, ctx: TraversalContext): number {
+    const sphere = this.accessorOf(key, ctx).volume;
     if (!sphere) {
       return 0;
     }
@@ -898,8 +847,8 @@ export class GlobeQuadtree {
   }
 
   /** 对齐 Cesium QuadtreePrimitive.screenSpaceError：透视 SSE + 雾削减 + pixelRatio 归一。 */
-  private screenSpaceError(tile: TerrainTileKey, state: TraversalTileState): number {
-    const maxGeometricError = this.terrainProvider.getLevelMaximumGeometricError(tile.level);
+  private screenSpaceError(level: number, state: TraversalTileState): number {
+    const maxGeometricError = this.terrainProvider.getLevelMaximumGeometricError(level);
     const distance = Math.max(1, state.distance);
     const sseDenominator = 2 * Math.tan((this.camera.fov * Math.PI / 180) * 0.5);
     let error = (maxGeometricError * this.drawingBufferHeight) / (distance * sseDenominator);
@@ -915,8 +864,8 @@ export class GlobeQuadtree {
   }
 
   /** 相机位置是否落在瓦片矩形内（对齐 Cesium containsNeededPosition）。 */
-  private containsNeededPosition(tile: TerrainTileKey): boolean {
-    const rectangle = this.rectangleOf(tile);
+  private containsNeededPosition(key: number): boolean {
+    const rectangle = this.rectangleOf(key);
     return (
       this.cameraCartographic.longitude >= rectangle.west &&
       this.cameraCartographic.longitude <= rectangle.east &&
@@ -926,17 +875,17 @@ export class GlobeQuadtree {
   }
 
   /** 椭球地平线可见性测试，避免细化相机背面的半球。 */
-  private isVisibleFromCamera(tile: TerrainTileKey): boolean {
+  private isVisibleFromCamera(key: number): boolean {
     if (Cartesian3.magnitude(this.cameraPosition) <= this.tilingScheme.ellipsoid.maximumRadius) return true;
     this.occluder.cameraPosition = this.cameraPosition;
-    const rectangle = this.rectangleOf(tile);
+    const rectangle = this.rectangleOf(key);
     const cullingPoint = this.occluder.computeHorizonCullingPointFromRectangle(rectangle, this.tilingScheme.ellipsoid);
     return !cullingPoint || this.occluder.isScaledSpacePointVisible(cullingPoint);
   }
 
   /** 取瓦片矩形中心经纬度。 */
-  private rectangleCenter(tile: TerrainTileKey): Cartographic {
-    const rectangle = this.rectangleOf(tile);
+  private rectangleCenter(key: number): Cartographic {
+    const rectangle = this.rectangleOf(key);
     return Cartographic.fromRadians(
       (rectangle.west + rectangle.east) * 0.5,
       (rectangle.south + rectangle.north) * 0.5,
@@ -944,44 +893,22 @@ export class GlobeQuadtree {
     );
   }
 
-  /* Legacy Cesium TraversalDetails pool.
-  private readonly detailsPool: TraversalDetails[] = [];
-
-  private acquireDetails(count: number): TraversalDetails[] {
-    const details: TraversalDetails[] = [];
-    for (let index = 0; index < count; index += 1) {
-      details.push(this.detailsPool.pop() ?? new TraversalDetails());
-    }
-    return details;
-  }
-
-  private releaseDetails(details: TraversalDetails[]): void {
-    for (const item of details) {
-      item.allAreRenderable = true;
-      item.anyWereRenderedLastFrame = false;
-      item.notYetRenderableCount = 0;
-      this.detailsPool.push(item);
-    }
-  }
-
-  */
-
-  /** level zero 瓦片列表。 */
-  private levelZeroTiles(): TerrainTileKey[] {
-    const roots: TerrainTileKey[] = [];
+  /** level zero 瓦片键列表。 */
+  private levelZeroTiles(): number[] {
+    const roots: number[] = [];
     const rootsX = this.tilingScheme.getNumberOfXTilesAtLevel(0);
     const rootsY = this.tilingScheme.getNumberOfYTilesAtLevel(0);
     for (let y = 0; y < rootsY; y += 1) {
       for (let x = 0; x < rootsX; x += 1) {
-        roots.push({ x, y, level: 0 });
+        roots.push(keyOf(0, x, y));
       }
     }
     return roots;
   }
 
   /** 添加瓦片到渲染列表。 */
-  private addTileToRenderList(ctx: TraversalContext, tile: TerrainTileKey): void {
-    ctx.renderList.push(tile);
+  private addTileToRenderList(ctx: TraversalContext, key: number): void {
+    ctx.renderList.push(key);
     this.debugCounts.rendered += 1;
   }
 
@@ -1101,8 +1028,7 @@ export class GlobeQuadtree {
   }
 
   /** 取得或创建瓦片持久状态。 */
-  private ensureState(tile: TerrainTileKey): TraversalTileState {
-    const key = this.tileKey(tile);
+  private ensureState(key: number): TraversalTileState {
     let state = this.states.get(key);
     if (!state) {
       state = {
@@ -1134,18 +1060,19 @@ export class GlobeQuadtree {
     return state;
   }
 
-  private stateOf(tile: TerrainTileKey): TraversalTileState {
-    const state = this.states.get(this.tileKey(tile));
+  private stateOf(key: number): TraversalTileState {
+    const state = this.states.get(key);
     if (state) return state;
-    return this.ensureState(tile);
+    return this.ensureState(key);
   }
 
   /** 限制缓存大小：超过上限时清掉本帧未访问的瓦片状态。 */
-  private sweepCache(touchedKeys: Set<string>): void {
+  private sweepCache(touchedKeys: Set<number>): void {
     if (this.states.size <= this.maximumCachedStates) {
       return;
     }
-    for (const key of [...this.states.keys()]) {
+    // Map 迭代器支持删除当前项，无需先展开成数组（避免一次大分配）。
+    for (const key of this.states.keys()) {
       if (!touchedKeys.has(key)) {
         this.states.delete(key);
         this.accessorCache.delete(key);

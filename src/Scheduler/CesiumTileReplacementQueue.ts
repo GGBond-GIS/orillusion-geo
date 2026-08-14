@@ -1,24 +1,24 @@
 /** Cesium TileReplacementQueue 双向链表节点。 */
-interface ReplacementNode<T> {
+interface ReplacementNode<T, K> {
   /** 瓦片唯一键。 */
-  key: string;
+  key: K;
   /** 瓦片状态对象。 */
   value: T;
   /** 更近使用的节点。 */
-  previous?: ReplacementNode<T>;
+  previous?: ReplacementNode<T, K>;
   /** 更久未使用的节点。 */
-  next?: ReplacementNode<T>;
+  next?: ReplacementNode<T, K>;
 }
 
 /**
  * Cesium TileReplacementQueue 的渲染器无关移植。
  * 链表头是本帧最近触碰的瓦片，帧开始哨兵确保当前帧访问过的瓦片绝不被淘汰。
  */
-export class CesiumTileReplacementQueue<T> {
-  private readonly nodes = new Map<string, ReplacementNode<T>>();
-  private head?: ReplacementNode<T>;
-  private tail?: ReplacementNode<T>;
-  private lastBeforeStartOfFrame?: ReplacementNode<T>;
+export class CesiumTileReplacementQueue<T, K = string> {
+  private readonly nodes = new Map<K, ReplacementNode<T, K>>();
+  private head?: ReplacementNode<T, K>;
+  private tail?: ReplacementNode<T, K>;
+  private lastBeforeStartOfFrame?: ReplacementNode<T, K>;
 
   /** 当前 replacement queue 中的瓦片数量。 */
   public get count(): number { return this.nodes.size; }
@@ -33,7 +33,7 @@ export class CesiumTileReplacementQueue<T> {
    * @param key 瓦片唯一键。
    * @param value 瓦片状态对象。
    */
-  public markTileRendered(key: string, value: T): void {
+  public markTileRendered(key: K, value: T): void {
     let node = this.nodes.get(key);
     if (!node) {
       node = { key, value };
@@ -59,7 +59,7 @@ export class CesiumTileReplacementQueue<T> {
    * @param eligible 判断瓦片当前是否允许卸载。
    * @param unload 执行地形、影像和 ECS 资源释放。
    */
-  public trimTiles(maximumTiles: number, eligible: (value: T, key: string) => boolean, unload: (value: T, key: string) => void): void {
+  public trimTiles(maximumTiles: number, eligible: (value: T, key: K) => boolean, unload: (value: T, key: K) => void): void {
     let node = this.tail;
     let keepTrimming = true;
     while (keepTrimming && this.lastBeforeStartOfFrame && this.nodes.size > maximumTiles && node) {
@@ -86,7 +86,7 @@ export class CesiumTileReplacementQueue<T> {
    * @param node 待移除节点。
    * @param removeFromMap 是否同时移除键索引。
    */
-  private unlink(node: ReplacementNode<T>, removeFromMap: boolean): void {
+  private unlink(node: ReplacementNode<T, K>, removeFromMap: boolean): void {
     if (node === this.lastBeforeStartOfFrame) this.lastBeforeStartOfFrame = node.next;
     if (node.previous) node.previous.next = node.next;
     else if (this.head === node) this.head = node.next;

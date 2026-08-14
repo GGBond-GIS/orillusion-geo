@@ -6,7 +6,7 @@ import { CesiumTileReplacementQueue } from '../Scheduler/CesiumTileReplacementQu
 import { CesiumImageryRuntime, CesiumSurfaceImagery } from '../Terrain/CesiumImagerySkeleton.js';
 import { CesiumSurfaceTile, type CesiumTerrainMesh } from '../Terrain/CesiumSurfaceTile.js';
 import { GlobeQuadtree, type GlobeTileAccessor, type GlobeTraversalResult } from '../Terrain/GlobeQuadtree.js';
-import { TerrainTileState, type TerrainTileKey } from '../Terrain/TerrainTileState.js';
+import { TerrainTileState } from '../Terrain/TerrainTileState.js';
 import { configureCesiumWorkerRuntime } from '../Terrain/CesiumWorkerRuntime.js';
 
 /** Cesium 瓦片坐标。 */
@@ -18,7 +18,7 @@ export interface GlobeOptions { engine: Engine3D; camera: Camera3D; terrainProvi
 /** 单个瓦片的 LOD 阶段耗时（毫秒），用于量化加载链路延迟。 */
 export interface GlobeStageTiming {
   /** 瓦片键。 */
-  key: string;
+  key: number;
   /** 创建 → 地形 Ready 耗时。 */
   terrainMs: number;
   /** 地形 Ready → 影像材质提交耗时。 */
@@ -80,50 +80,47 @@ export class Globe {
   /** 对齐 Cesium QuadtreePrimitive._loadQueueTimeSlice 的地形加载时间片（毫秒）。 */
   public loadQueueTimeSlice = 5.0;
   private readonly quadtree: GlobeQuadtree;
-  private readonly tiles = new Map<string, Object3D>();
-  private readonly surfaceTiles = new Map<string, CesiumSurfaceTile>();
-  private readonly surfaceImagery = new Map<string, CesiumSurfaceImagery>();
+  private readonly tiles = new Map<number, Object3D>();
+  private readonly surfaceTiles = new Map<number, CesiumSurfaceTile>();
+  private readonly surfaceImagery = new Map<number, CesiumSurfaceImagery>();
   private readonly imageryRuntime: CesiumImageryRuntime;
-  private readonly imageryMaterialRevision = new Map<string, number>();
+  private readonly imageryMaterialRevision = new Map<number, number>();
   private readonly terrainCommitQueue = new CesiumFrameTaskQueue(2.0);
   private readonly materialCommitQueue = new CesiumFrameTaskQueue(2.0);
-  private readonly queuedTerrainCommits = new Set<string>();
-  private readonly queuedMaterialCommits = new Set<string>();
-  private readonly tileReplacementQueue = new CesiumTileReplacementQueue<CesiumSurfaceTile>();
+  private readonly queuedTerrainCommits = new Set<number>();
+  private readonly queuedMaterialCommits = new Set<number>();
+  private readonly tileReplacementQueue = new CesiumTileReplacementQueue<CesiumSurfaceTile, number>();
   private readonly recycledMaterials: CesiumGlobeTileMaterial[] = [];
   private readonly placeholderMaterial: UnLitMaterial;
-  private readonly tileLoadWaiters = new Map<string, { promise: Promise<Object3D>; resolve: (object: Object3D) => void; reject: (error: Error) => void }>();
+  private readonly tileLoadWaiters = new Map<number, { promise: Promise<Object3D>; resolve: (object: Object3D) => void; reject: (error: Error) => void }>();
   private readonly stageTimings: GlobeStageTiming[] = [];
   private readonly options: GlobeOptions;
-  private lastSelected: GlobeTileCoordinate[] = [];
+  private lastSelected: number[] = [];
   private frameNumber = 0;
 
   /** GlobeTileAccessor：把 Cesium QuadtreeTile / GlobeSurfaceTile 的只读面暴露给选择器。 */
   private readonly accessor: GlobeTileAccessor = {
-    isFullyRenderable: (tile) => this.isRenderable(this.tileKey(tile)),
-    isCompletelyLoaded: (tile) => {
-      const key = this.tileKey(tile);
+    isFullyRenderable: (key) => this.isRenderable(key),
+    isCompletelyLoaded: (key) => {
       const surfaceTile = this.surfaceTiles.get(key);
       if (!surfaceTile || surfaceTile.state !== TerrainTileState.Ready) return false;
       const imagery = this.surfaceImagery.get(key);
       return !imagery || imagery.isDoneLoading;
     },
-    canRenderWithoutLosingDetail: (tile) => {
-      const key = this.tileKey(tile);
-      const surfaceTile = this.surfaceTiles.get(key);
+    canRenderWithoutLosingDetail: (key) => {
       // 对齐 Cesium：本瓦片地形必须就绪，且影像层全部就绪或完成。
+      const surfaceTile = this.surfaceTiles.get(key);
       if (!surfaceTile || surfaceTile.state !== TerrainTileState.Ready) return false;
       const imagery = this.surfaceImagery.get(key);
       if (imagery && !imagery.isReadyForCommit) return false;
       // 后代检查：上一帧渲染过的后代拥有真实地形时，渲染本瓦片会让细节消失，阻塞。
       return !this.descendantBlocksDetail(key);
     },
-    needsLoading: (tile) => {
-      const key = this.tileKey(tile);
-      const surfaceTile = this.surfaceTiles.get(key);
+    needsLoading: (key) => {
       // Traversal creates virtual quadtree children before Globe materializes their
       // CesiumSurfaceTile state. They must be considered loadable in this frame; update()
       // creates every touched SurfaceTile before consuming the returned load queues.
+      const surfaceTile = this.surfaceTiles.get(key);
       if (!surfaceTile) return true;
       if (surfaceTile.state !== TerrainTileState.Ready) return true;
       const imagery = this.surfaceImagery.get(key);
@@ -134,25 +131,23 @@ export class Globe {
       if (!this.imageryMaterialRevision.has(key)) return true;
       return imagery ? !imagery.isDoneLoading : false;
     },
-    hasTerrainData: (tile) => {
-      const surfaceTile = this.surfaceTiles.get(this.tileKey(tile));
-      return Boolean(surfaceTile?.terrainData);
+    hasTerrainData: (key) => {
+      return Boolean(this.surfaceTiles.get(key)?.terrainData);
     },
-    isUpsampledFromParent: (tile) => {
-      const key = this.tileKey(tile);
+    isUpsampledFromParent: (key) => {
       const surfaceTile = this.surfaceTiles.get(key);
       if (!surfaceTile?.upsampledFromParent) return false;
       const imagery = this.surfaceImagery.get(key);
       return imagery ? imagery.allTileImageryFailedOrInvalid : true;
     },
-    getBoundingVolume: (tile) => {
+    getBoundingVolume: (key) => {
       // Only return this tile's measured terrain bounds. GlobeQuadtree creates a tile-local
       // synthetic region for virtual/unloaded children; inheriting an ancestor sphere makes
       // every descendant appear visible at grazing angles.
-      return this.surfaceTiles.get(this.tileKey(tile))?.boundingVolume ?? undefined;
+      return this.surfaceTiles.get(key)?.boundingVolume ?? undefined;
     },
-    getHeightRange: (tile) => {
-      const mesh = this.surfaceTiles.get(this.tileKey(tile))?.mesh;
+    getHeightRange: (key) => {
+      const mesh = this.surfaceTiles.get(key)?.mesh;
       if (mesh && Number.isFinite(mesh.minimumHeight) && Number.isFinite(mesh.maximumHeight)) {
         return mesh;
       }
@@ -239,7 +234,7 @@ export class Globe {
 
     // 为所有遍历到的瓦片建立状态机（含父链），并保活 replacement queue（对齐 visitTile 的 markTileRendered）。
     for (const key of traversal.touchedKeys) {
-      const coordinate = this.parseTileKey(key);
+      const coordinate = this.quadtree.decodeKey(key);
       const tile = this.ensureSurfaceTile(coordinate);
       this.tileReplacementQueue.markTileRendered(key, tile);
     }
@@ -268,10 +263,10 @@ export class Globe {
   /** 返回当前选择、队列和资源计数。 */
   public get statistics(): GlobeStatistics {
     const renderedLevels: number[] = [];
-    for (const [key, object] of this.tiles) if (object.getComponent(MeshRenderer)?.enable) renderedLevels.push(this.parseTileKey(key).level);
+    for (const [key, object] of this.tiles) if (object.getComponent(MeshRenderer)?.enable) renderedLevels.push(this.quadtree.decodeKey(key).level);
     const imageryStatistics = this.imageryRuntime.statistics;
     return {
-      selectedLevels: [...new Set(this.lastSelected.map(tile => tile.level))].sort((a, b) => a - b),
+      selectedLevels: [...new Set(this.lastSelected.map(key => this.quadtree.decodeKey(key).level))].sort((a, b) => a - b),
       renderedLevels: [...new Set(renderedLevels)].sort((a, b) => a - b),
       terrainTileCount: this.tiles.size,
       imageryTileCount: this.surfaceImagery.size,
@@ -334,9 +329,9 @@ export class Globe {
   }
 
   /** 对齐 Cesium processSinglePriorityLoadQueue：队列已按优先级排序，时间片内推进状态机。 */
-  private processSingleLoadQueue(queue: TerrainTileKey[], endTime: number, didSomeLoading: boolean): boolean {
+  private processSingleLoadQueue(queue: number[], endTime: number, didSomeLoading: boolean): boolean {
     for (let index = 0; index < queue.length && (performance.now() < endTime || !didSomeLoading); index += 1) {
-      const key = this.tileKey(queue[index]);
+      const key = queue[index];
       const tile = this.surfaceTiles.get(key);
       if (!tile) continue;
       this.tileReplacementQueue.markTileRendered(key, tile);
@@ -351,7 +346,7 @@ export class Globe {
    * 只推进地形状态机；影像由 processImageryStateMachines 在同一帧推进，
    * 且只对确定可见（未被 CULLED_BUT_NEEDED）且包围体已准确（地形 Ready）的瓦片加载。
    */
-  private advanceTileLoad(key: string, tile: CesiumSurfaceTile): void {
+  private advanceTileLoad(key: number, tile: CesiumSurfaceTile): void {
     if (tile.update(this.terrainProvider, 1, 0)) this.enqueueTerrainCommit(key, tile);
   }
 
@@ -360,21 +355,21 @@ export class Globe {
    * 只处理本帧可渲染/已入队且未被 CULLED_BUT_NEEDED 的瓦片（对齐 Cesium terrainOnly 语义）。
    */
   private processImageryStateMachines(traversal: GlobeTraversalResult): void {
-    const keys = new Set<string>();
+    const keys = new Set<number>();
     // The quadtree has already sorted the high queue by screen-centre angle and distance. Feed
     // imagery in that order before the DFS render list; otherwise the first 18 DFS tiles can
     // repeatedly occupy every request slot and starve a central visible tile until the camera
     // moves enough to change traversal order.
-    for (const coordinate of traversal.loadQueueHigh) keys.add(this.tileKey(coordinate));
-    for (const coordinate of traversal.renderList) keys.add(this.tileKey(coordinate));
-    for (const coordinate of traversal.loadQueueMedium) keys.add(this.tileKey(coordinate));
-    for (const coordinate of traversal.loadQueueLow) keys.add(this.tileKey(coordinate));
+    for (const key of traversal.loadQueueHigh) keys.add(key);
+    for (const key of traversal.renderList) keys.add(key);
+    for (const key of traversal.loadQueueMedium) keys.add(key);
+    for (const key of traversal.loadQueueLow) keys.add(key);
     for (const key of traversal.culledButNeededKeys) keys.delete(key);
     for (const key of keys) this.processImageryForKey(key);
   }
 
   /** 推进单个瓦片的影像状态机，就绪后排队材质提交。 */
-  private processImageryForKey(key: string): void {
+  private processImageryForKey(key: number): void {
     const surfaceTile = this.surfaceTiles.get(key);
     if (!surfaceTile || surfaceTile.state !== TerrainTileState.Ready) return;
     const coordinate = surfaceTile.key;
@@ -411,7 +406,7 @@ export class Globe {
    * @param key 瓦片键。
    * @param tile 已得到 Cesium TerrainMesh 的瓦片。
    */
-  private enqueueTerrainCommit(key: string, tile: CesiumSurfaceTile): void {
+  private enqueueTerrainCommit(key: number, tile: CesiumSurfaceTile): void {
     if (this.tiles.has(key) || this.queuedTerrainCommits.has(key)) return;
     this.queuedTerrainCommits.add(key);
     void this.terrainCommitQueue.enqueue(() => {
@@ -521,7 +516,7 @@ export class Globe {
    * @param imagery 对应的最终影像状态机。
    * @param textures 已完成上传或重投影的纹理条目。
    */
-  private enqueueMaterialCommit(key: string, imagery: CesiumSurfaceImagery, textures: CesiumGlobeTileTexture[]): void {
+  private enqueueMaterialCommit(key: number, imagery: CesiumSurfaceImagery, textures: CesiumGlobeTileTexture[]): void {
     this.queuedMaterialCommits.add(key);
     const revision = imagery.revision;
     void this.materialCommitQueue.enqueue(() => {
@@ -552,7 +547,7 @@ export class Globe {
   }
 
   /** 记录瓦片 LOD 阶段耗时（保留最近 50 条）。 */
-  private recordStageTiming(key: string): void {
+  private recordStageTiming(key: number): void {
     const surfaceTile = this.surfaceTiles.get(key);
     if (!surfaceTile || surfaceTile.readyAt === 0) return;
     this.stageTimings.push({
@@ -565,7 +560,7 @@ export class Globe {
 
   /** 建立指定瓦片及其所有祖先。 */
   private ensureSurfaceTile(coordinate: GlobeTileCoordinate): CesiumSurfaceTile {
-    const key = this.tileKey(coordinate);
+    const key = this.quadtree.keyOf(coordinate.level, coordinate.x, coordinate.y);
     const cached = this.surfaceTiles.get(key);
     if (cached) return cached;
     const parent = coordinate.level === 0 ? null : this.ensureSurfaceTile({ x: Math.floor(coordinate.x / 2), y: Math.floor(coordinate.y / 2), level: coordinate.level - 1 });
@@ -576,21 +571,20 @@ export class Globe {
 
   /** 对齐 Cesium addTileToRenderList 后的绘制阶段：可渲染瓦片直接绘制，否则回退最近的可渲染祖先
    *  （Cesium 在此时绘制 fill，项目没有 fill 几何，用祖先替代，细节不消失）。 */
-  private applySelection(renderList: TerrainTileKey[]): void {
-    const candidates = new Set<string>();
-    for (const coordinate of renderList) {
-      const key = this.tileKey(coordinate);
+  private applySelection(renderList: number[]): void {
+    const candidates = new Set<number>();
+    for (const key of renderList) {
       if (this.isRenderable(key)) {
         candidates.add(key);
         continue;
       }
-      let ancestor = this.quadtree.parentKey(key);
-      while (ancestor) {
+      let ancestor = this.quadtree.parentKeyOf(key);
+      while (ancestor >= 0) {
         if (this.isRenderable(ancestor)) {
           candidates.add(ancestor);
           break;
         }
-        ancestor = this.quadtree.parentKey(ancestor);
+        ancestor = this.quadtree.parentKeyOf(ancestor);
       }
     }
 
@@ -600,19 +594,19 @@ export class Globe {
     // ancestor and the ready sibling would otherwise be drawn over the same surface for a frame.
     // Collapse the candidates to a quadtree antichain: an ancestor fallback atomically replaces
     // every candidate below it until all selected descendants are renderable.
-    const drawKeys = new Set<string>();
+    const drawKeys = new Set<number>();
     const shallowestFirst = [...candidates].sort((left, right) =>
-      this.parseTileKey(left).level - this.parseTileKey(right).level,
+      this.quadtree.decodeKey(left).level - this.quadtree.decodeKey(right).level,
     );
     for (const key of shallowestFirst) {
-      let ancestor = this.quadtree.parentKey(key);
+      let ancestor = this.quadtree.parentKeyOf(key);
       let coveredByAncestor = false;
-      while (ancestor) {
+      while (ancestor >= 0) {
         if (drawKeys.has(ancestor)) {
           coveredByAncestor = true;
           break;
         }
-        ancestor = this.quadtree.parentKey(ancestor);
+        ancestor = this.quadtree.parentKeyOf(ancestor);
       }
       if (!coveredByAncestor) drawKeys.add(key);
     }
@@ -642,7 +636,7 @@ export class Globe {
   }
 
   /** 地形实体和最终影像材质都提交后才允许显示。 */
-  private isRenderable(key: string): boolean {
+  private isRenderable(key: number): boolean {
     return this.surfaceTiles.get(key)?.state === TerrainTileState.Ready && this.tiles.has(key) && this.imageryMaterialRevision.has(key);
   }
 
@@ -651,12 +645,12 @@ export class Globe {
    * 遍历上一帧被细化（REFINED）的后代，若其中任一上一帧渲染过（RENDERED）且地形已就绪，
    * 渲染本瓦片会导致细节消失，返回 true 阻塞。
    */
-  private descendantBlocksDetail(key: string): boolean {
-    const stack: string[] = [];
+  private descendantBlocksDetail(key: number): boolean {
+    const stack: number[] = [];
     const children = this.childKeys(key);
     for (const child of children) stack.push(child);
     while (stack.length > 0) {
-      const descendant = stack.pop() as string;
+      const descendant = stack.pop() as number;
       if (this.quadtree.wasRenderedLastFrame(descendant, this.frameNumber)) {
         if (this.surfaceTiles.get(descendant)?.state === TerrainTileState.Ready) {
           return true;
@@ -669,16 +663,16 @@ export class Globe {
   }
 
   /** 取四个子瓦片键。 */
-  private childKeys(key: string): string[] {
-    const coordinate = this.parseTileKey(key);
+  private childKeys(key: number): number[] {
+    const coordinate = this.quadtree.decodeKey(key);
     const level = coordinate.level + 1;
     const x = coordinate.x * 2;
     const y = coordinate.y * 2;
     return [
-      this.tileKey({ x, y, level }),
-      this.tileKey({ x: x + 1, y, level }),
-      this.tileKey({ x, y: y + 1, level }),
-      this.tileKey({ x: x + 1, y: y + 1, level }),
+      this.quadtree.keyOf(level, x, y),
+      this.quadtree.keyOf(level, x + 1, y),
+      this.quadtree.keyOf(level, x, y + 1),
+      this.quadtree.keyOf(level, x + 1, y + 1),
     ];
   }
 
@@ -750,7 +744,7 @@ export class Globe {
   }
 
   /** 瓦片实体创建完成时兑现 loadTile 等待者。 */
-  private resolveTileLoadWaiters(key: string, object: Object3D): void {
+  private resolveTileLoadWaiters(key: number, object: Object3D): void {
     const waiter = this.tileLoadWaiters.get(key);
     if (waiter) {
       this.tileLoadWaiters.delete(key);
@@ -759,7 +753,7 @@ export class Globe {
   }
 
   /** 瓦片被淘汰时拒绝 loadTile 等待者。 */
-  private rejectTileLoadWaiters(key: string): void {
+  private rejectTileLoadWaiters(key: number): void {
     const waiter = this.tileLoadWaiters.get(key);
     if (waiter) {
       this.tileLoadWaiters.delete(key);
@@ -791,14 +785,7 @@ export class Globe {
   }
 
   /** 生成内部瓦片键。 */
-  private tileKey(tile: GlobeTileCoordinate): string { return `${tile.level}/${tile.x}/${tile.y}`; }
-
-  /** 从内部瓦片键恢复坐标（热路径：避免 split/map 分配）。 */
-  private parseTileKey(key: string): GlobeTileCoordinate {
-    const first = key.indexOf('/');
-    const second = key.indexOf('/', first + 1);
-    return { x: Number(key.slice(first + 1, second)), y: Number(key.slice(second + 1)), level: Number(key.slice(0, first)) };
-  }
+  private tileKey(tile: GlobeTileCoordinate): number { return this.quadtree.keyOf(tile.level, tile.x, tile.y); }
 
   private lastTraversal: GlobeTraversalResult | null = null;
 }

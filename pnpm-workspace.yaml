@@ -1,3 +1,7 @@
+# pnpm 11 项目配置（.npmrc 已被 pnpm 11 弃用，项目配置统一放这里）。
+# 本地开发使用 fork 构建的核心包（直接覆盖 node_modules/.pnpm/@orillusion+core 的 dist），
+# pnpm run 前不应因 node_modules 内容变化自动触发 install（会还原覆盖）。
+verifyDepsBeforeRun: false
 allowBuilds:
-  esbuild: set this to true or false
-  protobufjs: set this to true or false
+  esbuild: true
+  protobufjs: true
