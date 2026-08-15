@@ -578,6 +578,10 @@ export class CesiumSurfaceImagery {
     if (!managed.image) { managed.state = ImageryState.Invalid; return; }
     const image = managed.image;
     const texture = new BitmapTexture2D(true, this.options.context, 'srgb');
+    // 影像瓦片的 UV 会精确落在 0/1 边界。Texture 默认的 repeat 会让线性过滤
+    // 混入对侧像素，在相邻瓦片之间形成亮缝；Cesium 的影像采样语义应固定为边缘钳制。
+    texture.addressModeU = 'clamp-to-edge';
+    texture.addressModeV = 'clamp-to-edge';
     texture.source = image;
     // Cesium Resource 通常返回 ImageBitmap。Orillusion 会同时把它保存在 `_source` 和
     // `_sourceImageData`，即使 GPU 上传完成也不清空，数百张瓦片会因此长期占用原生

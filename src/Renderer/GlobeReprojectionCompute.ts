@@ -99,6 +99,10 @@ export class GlobeReprojectionCompute {
       for (let index = 0; index < count; index += 1) {
         const task = tasks[index];
         const target = new RenderTexture(task.options.width, task.options.height, 'rgba8unorm', false, 0x01 | 0x02 | 0x04 | 0x08 | 0x10, 1, 0, false, false, this.context);
+        // 重投影结果后续也会作为地形影像采样。保持和原始影像一致的边缘钳制，
+        // 避免在线性过滤下从另一侧回绕取样。
+        target.addressModeU = 'clamp-to-edge';
+        target.addressModeV = 'clamp-to-edge';
         targets.push(target);
         // 使用源纹理自带的 sampler（filtering，与源纹理的 mipmap 配置一致），
         // 避免自建 sampler 与纹理视图的 maxLod 校验不匹配。
